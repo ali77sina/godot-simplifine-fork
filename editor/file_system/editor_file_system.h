@@ -52,7 +52,7 @@ class EditorFileSystemDirectory : public Object {
 	EditorFileSystemDirectory *parent = nullptr;
 	Vector<EditorFileSystemDirectory *> subdirs;
 
-	struct FileInfo {
+	struct EFSDFIleInfo {
 		String file;
 		StringName type;
 		StringName resource_script_class; // If any resource has script with a global class name, its found here.
@@ -76,7 +76,7 @@ class EditorFileSystemDirectory : public Object {
 		ScriptClassInfo class_info;
 	};
 
-	Vector<FileInfo *> files;
+	Vector<EFSDFIleInfo *> files;
 
 	static void _bind_methods();
 
@@ -164,7 +164,7 @@ class EditorFileSystem : public Node {
 		EditorFileSystemDirectory *dir = nullptr;
 		String file;
 		EditorFileSystemDirectory *new_dir = nullptr;
-		EditorFileSystemDirectory::FileInfo *new_file = nullptr;
+		EditorFileSystemDirectory::EFSDFIleInfo *new_file = nullptr;
 	};
 
 	struct ScannedDirectory {
@@ -210,7 +210,7 @@ class EditorFileSystem : public Node {
 
 	static EditorFileSystem *singleton;
 
-	using ScriptClassInfo = EditorFileSystemDirectory::FileInfo::ScriptClassInfo;
+	using ScriptClassInfo = EditorFileSystemDirectory::EFSDFIleInfo::ScriptClassInfo;
 
 	/* Used for reading the filesystem cache file */
 	struct FileCache {
@@ -301,7 +301,7 @@ class EditorFileSystem : public Node {
 		ScriptClassInfoUpdate() = default;
 		explicit ScriptClassInfoUpdate(const ScriptClassInfo &p_info) :
 				ScriptClassInfo(p_info) {}
-		static ScriptClassInfoUpdate from_file_info(const EditorFileSystemDirectory::FileInfo *p_fi) {
+		static ScriptClassInfoUpdate from_file_info(const EditorFileSystemDirectory::EFSDFIleInfo *p_fi) {
 			ScriptClassInfoUpdate update;
 			update.type = p_fi->type;
 			update.name = p_fi->class_info.name;
@@ -367,10 +367,10 @@ class EditorFileSystem : public Node {
 
 	Vector<Ref<EditorFileSystemImportFormatSupportQuery>> import_support_queries;
 
-	void _update_file_icon_path(EditorFileSystemDirectory::FileInfo *file_info);
+	void _update_file_icon_path(EditorFileSystemDirectory::EFSDFIleInfo *file_info);
 	void _update_files_icon_path(EditorFileSystemDirectory *edp = nullptr);
 	bool _remove_invalid_global_class_names(const HashSet<String> &p_existing_class_names);
-	String _get_file_by_class_name(EditorFileSystemDirectory *p_dir, const String &p_class_name, EditorFileSystemDirectory::FileInfo *&r_file_info);
+	String _get_file_by_class_name(EditorFileSystemDirectory *p_dir, const String &p_class_name, EditorFileSystemDirectory::EFSDFIleInfo *&r_file_info);
 
 	void _register_global_class_script(const String &p_search_path, const String &p_target_path, const ScriptClassInfoUpdate &p_script_update);
 

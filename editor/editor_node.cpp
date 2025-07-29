@@ -80,6 +80,7 @@
 #include "editor/debugger/editor_debugger_node.h"
 #include "editor/debugger/script_editor_debugger.h"
 #include "editor/doc/editor_help.h"
+#include "editor/docks/ai_chat_dock.h"
 #include "editor/docks/editor_dock_manager.h"
 #include "editor/docks/filesystem_dock.h"
 #include "editor/docks/history_dock.h"
@@ -8354,6 +8355,8 @@ EditorNode::EditorNode() {
 	get_project_settings()->connect_filesystem_dock_signals(filesystem_dock);
 
 	history_dock = memnew(HistoryDock);
+	ai_chat_dock = memnew(AIChatDock);
+	ai_chat_dock->set_api_endpoint("http://127.0.0.1:8000/chat");
 
 	// Scene: Top left.
 	editor_dock_manager->add_dock(SceneTreeDock::get_singleton(), TTRC("Scene"), EditorDockManager::DOCK_SLOT_LEFT_UR, ED_SHORTCUT_AND_COMMAND("docks/open_scene", TTRC("Open Scene Dock")), "PackedScene");
@@ -8373,6 +8376,9 @@ EditorNode::EditorNode() {
 	// History: Full height right, behind Node.
 	editor_dock_manager->add_dock(history_dock, TTRC("History"), EditorDockManager::DOCK_SLOT_RIGHT_UL, ED_SHORTCUT_AND_COMMAND("docks/open_history", TTRC("Open History Dock")), "History");
 
+	// AI Chat: Full height right, behind History.
+	editor_dock_manager->add_dock(ai_chat_dock, TTRC("AI Chat"), EditorDockManager::DOCK_SLOT_RIGHT_UL, ED_SHORTCUT_AND_COMMAND("docks/open_ai_chat", TTRC("Open AI Chat Dock")), "RigidBody3D");
+
 	// Add some offsets to left_r and main hsplits to make LEFT_R and RIGHT_L docks wider than minsize.
 	left_r_hsplit->set_split_offset(270 * EDSCALE);
 	main_hsplit->set_split_offset(-270 * EDSCALE);
@@ -8384,7 +8390,7 @@ EditorNode::EditorNode() {
 	// Dock numbers are based on DockSlot enum value + 1.
 	default_layout->set_value(docks_section, "dock_3", "Scene,Import");
 	default_layout->set_value(docks_section, "dock_4", "FileSystem");
-	default_layout->set_value(docks_section, "dock_5", "Inspector,Node,History");
+	default_layout->set_value(docks_section, "dock_5", "Inspector,Node,History,AI Chat");
 
 	// There are 4 vsplits and 4 hsplits.
 	for (int i = 0; i < editor_dock_manager->get_vsplit_count(); i++) {
