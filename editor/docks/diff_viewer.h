@@ -5,7 +5,7 @@
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
 #include "scene/gui/check_box.h"
-#include "dtl/dtl.hpp"
+#include "dtl.hpp"
 #include <vector>
 #include "common.h"
 

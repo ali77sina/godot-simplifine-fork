@@ -1,0 +1,6 @@
+# Python dependencies for the Godot AI Backend server
+
+flask
+python-dotenv
+openai>=1.50.0  # Required for responses API and image generation
+requests 

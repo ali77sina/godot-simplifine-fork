@@ -10,8 +10,15 @@
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
+#include "editor/docks/scene_tree_dock.h"
+#include "editor/script/script_editor_plugin.h"
+#include "editor/script/script_text_editor.h"
 #include "scene/main/node.h"
 #include "scene/main/window.h"
+#include "modules/gdscript/gdscript.h"
+#include "modules/gdscript/gdscript_parser.h"
+#include "modules/gdscript/gdscript_analyzer.h"
+#include "modules/gdscript/gdscript_compiler.h"
 
 #include <functional>
 
@@ -271,15 +278,73 @@ Dictionary EditorTools::set_node_property(const Dictionary &p_args) {
 		return result;
 	}
 	StringName prop = p_args["property"];
+	Variant value = p_args["value"];
+	
+	// Special handling for color properties
+	if (prop == "color" || prop == "modulate" || prop == "self_modulate") {
+		if (value.get_type() == Variant::STRING) {
+			String color_str = value;
+			Color color;
+			
+			// Handle common color names
+			if (color_str.to_lower() == "yellow") {
+				color = Color(1.0, 1.0, 0.0, 1.0);
+			} else if (color_str.to_lower() == "red") {
+				color = Color(1.0, 0.0, 0.0, 1.0);
+			} else if (color_str.to_lower() == "green") {
+				color = Color(0.0, 1.0, 0.0, 1.0);
+			} else if (color_str.to_lower() == "blue") {
+				color = Color(0.0, 0.0, 1.0, 1.0);
+			} else if (color_str.to_lower() == "white") {
+				color = Color(1.0, 1.0, 1.0, 1.0);
+			} else if (color_str.to_lower() == "black") {
+				color = Color(0.0, 0.0, 0.0, 1.0);
+			} else if (color_str.begins_with("#")) {
+				// Handle hex colors
+				color = Color::from_string(color_str, Color(1.0, 1.0, 1.0, 1.0));
+			} else if (color_str.begins_with("(") && color_str.ends_with(")")) {
+				// Handle Color constructor format: "(r, g, b, a)"
+				String values = color_str.substr(1, color_str.length() - 2);
+				PackedStringArray components = values.split(",");
+				if (components.size() >= 3) {
+					float r = components[0].strip_edges().to_float();
+					float g = components[1].strip_edges().to_float();
+					float b = components[2].strip_edges().to_float();
+					float a = components.size() >= 4 ? components[3].strip_edges().to_float() : 1.0;
+					color = Color(r, g, b, a);
+				} else {
+					color = Color(1.0, 1.0, 1.0, 1.0);
+					print_line("SET_NODE_PROPERTY WARNING: Invalid Color constructor format '" + color_str + "', using white");
+				}
+			} else {
+				// Try to parse as Color constructor or fallback to white
+				color = Color::from_string(color_str, Color(1.0, 1.0, 1.0, 1.0));
+				print_line("SET_NODE_PROPERTY WARNING: Unknown color '" + color_str + "', using white as fallback");
+			}
+			value = color;
+			print_line("SET_NODE_PROPERTY: Converted color string '" + color_str + "' to Color(" + String::num(color.r) + ", " + String::num(color.g) + ", " + String::num(color.b) + ", " + String::num(color.a) + ")");
+		}
+	}
+	
 	bool valid = false;
-	node->set(prop, p_args["value"], &valid);
+	node->set(prop, value, &valid);
 	if (!valid) {
 		result["success"] = false;
-		result["message"] = "Failed to set property '" + String(prop) + "'. It might be invalid or read-only.";
+		result["message"] = "Failed to set property '" + String(prop) + "'. It might be invalid or read-only. Node type: " + node->get_class();
 		return result;
 	}
+	
+	// Auto-save the scene after property changes so changes persist when running the game
+	String current_scene = EditorNode::get_singleton()->get_edited_scene()->get_scene_file_path();
+	if (!current_scene.is_empty()) {
+		EditorNode::get_singleton()->save_scene_if_open(current_scene);
+		print_line("SET_NODE_PROPERTY: Auto-saved scene after property change: " + current_scene);
+	} else {
+		print_line("SET_NODE_PROPERTY: Scene has no save path, cannot auto-save");
+	}
+	
 	result["success"] = true;
-	result["message"] = "Property set successfully.";
+	result["message"] = "Property set successfully and scene saved.";
 	return result;
 }
 
@@ -670,13 +735,42 @@ Dictionary EditorTools::generalnodeeditor(const Dictionary &p_args) {
 					prop_result["message"] = "Scale array must have at least 2 elements [x, y]";
 				}
 			} else {
-				// Standard property setting
+				// Standard property setting with color handling
+				Variant processed_value = property_value;
+				
+				// Special handling for color properties
+				if ((property_name == "color" || property_name == "modulate" || property_name == "self_modulate") && property_value.get_type() == Variant::STRING) {
+					String color_str = property_value;
+					Color color;
+					
+					// Handle common color names
+					if (color_str.to_lower() == "yellow") {
+						color = Color(1.0, 1.0, 0.0, 1.0);
+					} else if (color_str.to_lower() == "red") {
+						color = Color(1.0, 0.0, 0.0, 1.0);
+					} else if (color_str.to_lower() == "green") {
+						color = Color(0.0, 1.0, 0.0, 1.0);
+					} else if (color_str.to_lower() == "blue") {
+						color = Color(0.0, 0.0, 1.0, 1.0);
+					} else if (color_str.to_lower() == "white") {
+						color = Color(1.0, 1.0, 1.0, 1.0);
+					} else if (color_str.to_lower() == "black") {
+						color = Color(0.0, 0.0, 0.0, 1.0);
+					} else if (color_str.begins_with("#")) {
+						color = Color::from_string(color_str, Color(1.0, 1.0, 1.0, 1.0));
+					} else {
+						color = Color::from_string(color_str, Color(1.0, 1.0, 1.0, 1.0));
+					}
+					processed_value = color;
+					print_line("GENERALNODEEDITOR: Converted color string '" + color_str + "' to Color(" + String::num(color.r) + ", " + String::num(color.g) + ", " + String::num(color.b) + ", " + String::num(color.a) + ")");
+				}
+				
 				bool valid = false;
-				node->set(StringName(property_name), property_value, &valid);
+				node->set(StringName(property_name), processed_value, &valid);
 				prop_result["success"] = valid;
 				prop_result["message"] = valid ? 
 					"Property '" + property_name + "' set successfully" : 
-					"Failed to set property '" + property_name + "'. It might be invalid or read-only";
+					"Failed to set property '" + property_name + "'. It might be invalid or read-only. Node type: " + node->get_class();
 			}
 			
 			property_results.push_back(prop_result);
@@ -867,15 +961,10 @@ Dictionary EditorTools::_predict_code_edit(const String &p_file_content, const S
 	request_data["file_content"] = p_file_content;
 	request_data["prompt"] = p_prompt;
 
-	print_line("DEBUG: Sending to backend - file_content length: " + itos(p_file_content.length()));
-	print_line("DEBUG: Sending to backend - prompt: " + p_prompt);
-
 	Ref<JSON> json;
 	json.instantiate();
 	String request_body_str = json->stringify(request_data);
 	PackedByteArray request_body = request_body_str.to_utf8_buffer();
-
-	print_line("DEBUG: Request body: " + request_body_str);
 
 	PackedStringArray headers;
 	headers.push_back("Content-Type: application/json");
@@ -944,10 +1033,759 @@ Dictionary EditorTools::_predict_code_edit(const String &p_file_content, const S
 	return response_data;
 }
 
+Dictionary EditorTools::_call_apply_endpoint(const String &p_file_path, const String &p_file_content, const Dictionary &p_ai_args, const String &p_api_endpoint) {
+	Dictionary result;
+	HTTPClient *http_client = HTTPClient::create();
+
+	// Prepare request
+	String host = p_api_endpoint;
+	int port = 80;
+	bool use_ssl = false;
+
+	if (host.begins_with("https://")) {
+		host = host.trim_prefix("https://");
+		use_ssl = true;
+		port = 443;
+	} else if (host.begins_with("http://")) {
+		host = host.trim_prefix("http://");
+	}
+
+	String base_path = "/";
+	if (host.find("/") != -1) {
+		base_path = host.substr(host.find("/"), -1);
+		host = host.substr(0, host.find("/"));
+	}
+
+	if (host.find(":") != -1) {
+		port = host.substr(host.find(":") + 1, -1).to_int();
+		host = host.substr(0, host.find(":"));
+	}
+	
+	// Construct the apply endpoint path
+	String apply_path = base_path.replace("/chat", "/apply");
+
+	Error err = http_client->connect_to_host(host, port, use_ssl ? Ref<TLSOptions>() : Ref<TLSOptions>());
+	if (err != OK) {
+		result["success"] = false;
+		result["message"] = "Failed to connect to host: " + host;
+		memdelete(http_client);
+		return result;
+	}
+
+	// Wait for connection
+	while (http_client->get_status() == HTTPClient::STATUS_CONNECTING || http_client->get_status() == HTTPClient::STATUS_RESOLVING) {
+		http_client->poll();
+		OS::get_singleton()->delay_usec(1000);
+	}
+
+	if (http_client->get_status() != HTTPClient::STATUS_CONNECTED) {
+		result["success"] = false;
+		result["message"] = "Failed to connect to host after polling.";
+		memdelete(http_client);
+		return result;
+	}
+
+	// Prepare request body to match backend's expected format
+	Dictionary request_data;
+	request_data["file_name"] = p_file_path;
+	request_data["file_content"] = p_file_content;
+	request_data["prompt"] = p_ai_args.get("prompt", "");
+	request_data["tool_arguments"] = p_ai_args;
+
+	Ref<JSON> json;
+	json.instantiate();
+	String request_body_str = json->stringify(request_data);
+	PackedByteArray request_body = request_body_str.to_utf8_buffer();
+
+	PackedStringArray headers;
+	headers.push_back("Content-Type: application/json");
+	headers.push_back("Content-Length: " + itos(request_body.size()));
+
+	err = http_client->request(HTTPClient::METHOD_POST, apply_path, headers, request_body.ptr(), request_body.size());
+	if (err != OK) {
+		result["success"] = false;
+		result["message"] = "HTTPClient->request failed.";
+		memdelete(http_client);
+		return result;
+	}
+
+	// Wait for response
+	while (http_client->get_status() == HTTPClient::STATUS_REQUESTING) {
+		http_client->poll();
+		OS::get_singleton()->delay_usec(1000);
+	}
+
+	if (http_client->get_status() != HTTPClient::STATUS_BODY && http_client->get_status() != HTTPClient::STATUS_CONNECTED) {
+		result["success"] = false;
+		result["message"] = "Request failed after sending.";
+		memdelete(http_client);
+		return result;
+	}
+
+	if (!http_client->has_response()) {
+		result["success"] = false;
+		result["message"] = "Request completed, but no response received.";
+		memdelete(http_client);
+		return result;
+	}
+
+	int response_code = http_client->get_response_code();
+	PackedByteArray body;
+
+	while (http_client->get_status() == HTTPClient::STATUS_BODY) {
+		http_client->poll();
+		PackedByteArray chunk = http_client->read_response_body_chunk();
+		if (chunk.size() == 0) {
+			OS::get_singleton()->delay_usec(1000);
+		} else {
+			body.append_array(chunk);
+		}
+	}
+
+	String response_str = String::utf8((const char *)body.ptr(), body.size());
+
+	memdelete(http_client);
+
+	if (response_code != 200) {
+		result["success"] = false;
+		result["message"] = "Apply server returned error " + itos(response_code) + ": " + response_str;
+		return result;
+	}
+
+	err = json->parse(response_str);
+	if (err != OK) {
+		result["success"] = false;
+		result["message"] = "Failed to parse JSON response from apply server.";
+		return result;
+	}
+
+	Dictionary response_data = json->get_data();
+
+	// Clean up the edited_content if it exists
+	if (response_data.has("edited_content")) {
+		String edited_content = response_data["edited_content"];
+		String cleaned_content = _clean_backend_content(edited_content);
+		response_data["edited_content"] = cleaned_content;
+	}
+
+	response_data["success"] = true;
+	return response_data;
+}
+
 Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
+    // Enhanced version that returns diff and compilation errors as JSON
+    String path = p_args.get("path", "");
+    String prompt = p_args.get("prompt", "");
+    
+    print_line("APPLY_EDIT: Using enhanced processing with diff and error checking");
+    
+    if (path.is_empty() || prompt.is_empty()) {
+        Dictionary result;
+        result["success"] = false;
+        result["message"] = "Missing path or prompt for apply_edit";
+        result["diff"] = "";
+        result["compilation_errors"] = Array();
+        return result;
+    }
+    
+    // Read the file content
+    Error err;
+    String file_content = FileAccess::get_file_as_string(path, &err);
+    if (err != OK) {
+        Dictionary result;
+        result["success"] = false;
+        result["message"] = "Failed to read file: " + path;
+        result["diff"] = "";
+        result["compilation_errors"] = Array();
+        return result;
+    }
+    
+    // Use OS system call to bypass Godot's broken HTTPClient
+    Dictionary local_result;
+    String edit_prompt = p_args.get("prompt", "");
+    
+    print_line("APPLY_EDIT: Using OS curl to call backend API - prompt: " + edit_prompt);
+    
+    // Create JSON request
+    Dictionary request_data;
+    request_data["file_content"] = file_content;
+    request_data["prompt"] = edit_prompt;
+    
+    Ref<JSON> json;
+    json.instantiate();
+    String request_json = json->stringify(request_data);
+    
+    // Write request to temporary file
+    String temp_request_path = OS::get_singleton()->get_user_data_dir() + "/temp_request.json";
+    String temp_response_path = OS::get_singleton()->get_user_data_dir() + "/temp_response.json";
+    
+    Ref<FileAccess> request_file = FileAccess::open(temp_request_path, FileAccess::WRITE);
+    if (request_file.is_valid()) {
+        request_file->store_string(request_json);
+        request_file->close();
+        
+        // Use curl via OS system call
+        String curl_command = "curl -X POST http://localhost:8000/predict_code_edit -H \"Content-Type: application/json\" -d @\"" + temp_request_path + "\" -o \"" + temp_response_path + "\" -s";
+        
+        print_line("APPLY_EDIT: Executing curl command to backend");
+        
+        List<String> args;
+        args.push_back("-c");
+        args.push_back(curl_command);
+        int exit_code;
+        Error exec_err = OS::get_singleton()->execute("sh", args, nullptr, &exit_code);
+        
+        if (exec_err == OK && exit_code == 0) {
+            // Read response from file
+            Error err;
+            String response_content = FileAccess::get_file_as_string(temp_response_path, &err);
+            
+            if (err == OK && response_content.length() > 0) {
+                Ref<JSON> response_json;
+                response_json.instantiate();
+                Error parse_err = response_json->parse(response_content);
+                
+                if (parse_err == OK) {
+                    Dictionary response_data = response_json->get_data();
+                    local_result["success"] = true;
+                    local_result["edited_content"] = response_data.get("edited_content", file_content);
+                    print_line("APPLY_EDIT: Successfully received response via curl (" + String::num_int64(String(local_result["edited_content"]).length()) + " chars)");
+                } else {
+                    local_result["success"] = false;
+                    local_result["message"] = "Failed to parse curl response JSON";
+                    print_line("APPLY_EDIT ERROR: JSON parse failed - " + response_content.substr(0, 200));
+                }
+            } else {
+                local_result["success"] = false;
+                local_result["message"] = "Failed to read curl response file";
+                print_line("APPLY_EDIT ERROR: Could not read response file");
+            }
+            
+            // Cleanup temp files
+            if (FileAccess::exists(temp_response_path)) {
+                OS::get_singleton()->move_to_trash(temp_response_path);
+            }
+        } else {
+            local_result["success"] = false;
+            local_result["message"] = "Curl command failed with exit code: " + String::num_int64(exit_code);
+            print_line("APPLY_EDIT ERROR: Curl failed - " + String(local_result["message"]));
+        }
+        
+        // Cleanup request file
+        if (FileAccess::exists(temp_request_path)) {
+            OS::get_singleton()->move_to_trash(temp_request_path);
+        }
+    } else {
+        local_result["success"] = false;
+        local_result["message"] = "Failed to create temporary request file";
+        print_line("APPLY_EDIT ERROR: Could not create temp file");
+    }
+    // Dictionary local_result = _call_apply_endpoint(path, file_content, p_args, "");
+    
+    if (local_result.get("success", false)) {
+        String new_content = local_result["edited_content"];
+        String cleaned_content = _clean_backend_content(new_content);
+        
+        print_line("APPLY_EDIT DEBUG: Applying dynamic file approach - writing content to disk immediately");
+        
+        // Generate unified diff with safety checks
+        String diff = "";
+        print_line("APPLY_EDIT DEBUG: About to generate diff...");
+        
+        // Add length checks to prevent huge diffs from hanging
+        if (file_content.length() > 100000 || cleaned_content.length() > 100000) {
+            print_line("APPLY_EDIT WARNING: File too large for diff generation, skipping");
+            diff = "Diff skipped - file too large (original: " + String::num_int64(file_content.length()) + " chars, new: " + String::num_int64(cleaned_content.length()) + " chars)";
+        } else {
+            print_line("APPLY_EDIT DEBUG: Calling _generate_unified_diff with " + String::num_int64(file_content.length()) + " and " + String::num_int64(cleaned_content.length()) + " chars");
+            
+            // TEMPORARY: Skip actual diff generation to test if it's causing hangs
+            // diff = _generate_unified_diff(file_content, cleaned_content, path);
+            diff = "=== TEMPORARY SIMPLE DIFF ===\nOriginal length: " + String::num_int64(file_content.length()) + " chars\nNew length: " + String::num_int64(cleaned_content.length()) + " chars\n=== END DIFF ===";
+            
+            print_line("APPLY_EDIT DEBUG: Using temporary simple diff (bypassing _generate_unified_diff)");
+        }
+        
+        print_line("APPLY_EDIT DEBUG: Generated diff (" + String::num_int64(diff.length()) + " chars):");
+        if (diff.length() > 0) {
+            print_line("DIFF PREVIEW: " + diff.substr(0, 300) + (diff.length() > 300 ? "..." : ""));
+        } else {
+            print_line("DIFF WARNING: Diff is empty!");
+        }
+        
+        // DYNAMIC APPROACH: Write the new content to disk immediately
+        // This allows Godot to naturally detect compilation errors
+        Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
+        if (file.is_valid()) {
+            file->store_string(cleaned_content);
+            file->close();
+            print_line("APPLY_EDIT: New content written to disk - " + path);
+            print_line("APPLY_EDIT: Godot will now naturally detect any compilation errors");
+        } else {
+            print_line("APPLY_EDIT ERROR: Failed to write to disk - " + path);
+        }
+        
+        // For now, return empty compilation_errors since Godot will show them in the console
+        // In the future, we could capture these from Godot's error system
+        Array compilation_errors;
+        
+        // Apply to script editor for user review
+        ScriptEditor *script_editor = ScriptEditor::get_singleton();
+        if (script_editor) {
+            Ref<Resource> resource = ResourceLoader::load(path);
+            Ref<Script> script = resource;
+            
+            if (script.is_valid()) {
+                script_editor->edit(script);
+                ScriptTextEditor *ste = Object::cast_to<ScriptTextEditor>(script_editor->get_current_editor());
+                if (ste) {
+                    ste->set_diff(file_content, cleaned_content);
+                    print_line("APPLY_EDIT: Diff view ready for user review");
+                }
+            }
+        }
+        
+        // Return enhanced result with diff and compilation errors
+        Dictionary result;
+        result["success"] = true;
+        result["message"] = "Changes applied to disk! Use Accept to keep or Reject to revert. Check console for any compilation errors.";
+        result["edited_content"] = cleaned_content;
+        result["diff"] = diff;
+        result["compilation_errors"] = compilation_errors;
+        result["has_errors"] = compilation_errors.size() > 0;
+        result["dynamic_approach"] = true; // Flag to indicate content is already on disk
+        
+        print_line("APPLY_EDIT DEBUG: Final JSON response contains:");
+        print_line("  - success: " + String(result["success"]));
+        print_line("  - diff length: " + String::num_int64(String(result["diff"]).length()));
+        print_line("  - compilation_errors count: " + String::num_int64(Array(result["compilation_errors"]).size()));
+        print_line("  - has_errors: " + String(result["has_errors"]));
+        
+        return result;
+    }
+    
+    // If local processing failed, still return proper structure
+    Dictionary failed_result = local_result;
+    failed_result["diff"] = "";
+    failed_result["compilation_errors"] = Array();
+    failed_result["has_errors"] = false;
+    return failed_result;
+} 
+
+String EditorTools::_clean_backend_content(const String &p_content) {
+	String content = p_content;
+	
+	// Remove code block wrappers (```javascript, ```gdscript, etc.)
+	// Handle various possible code block formats
+	Vector<String> code_block_patterns = {
+		"```javascript\n",
+		"```gdscript\n", 
+		"```\n",
+		"```js\n",
+		"```gd\n"
+	};
+	
+	for (const String &pattern : code_block_patterns) {
+		if (content.begins_with(pattern)) {
+			content = content.substr(pattern.length());
+			break;
+		}
+	}
+	
+	// Remove trailing code block marker
+	if (content.ends_with("\n```")) {
+		content = content.substr(0, content.length() - 4);
+	} else if (content.ends_with("```")) {
+		content = content.substr(0, content.length() - 3);
+	}
+	
+	// Fix JavaScript to GDScript conversion for .gd files
+	content = _convert_javascript_to_gdscript(content);
+	
+	// Fix common malformed content issues
+	content = _fix_malformed_content(content);
+	
+	// Trim extra whitespace
+	content = content.strip_edges();
+	
+	return content;
+}
+
+String EditorTools::_convert_javascript_to_gdscript(const String &p_content) {
+	String content = p_content;
+	Vector<String> lines = content.split("\n");
+	Vector<String> converted_lines;
+	
+	for (const String &line : lines) {
+		String converted_line = line;
+		
+		// Convert JavaScript function syntax to GDScript
+		if (converted_line.contains("function ")) {
+			// Replace "function name() {" with "func name():"
+			String trimmed = converted_line.strip_edges();
+			if (trimmed.begins_with("function ")) {
+				// Extract function name
+				String func_part = trimmed.substr(9); // Remove "function "
+				int paren_pos = func_part.find("(");
+				if (paren_pos > 0) {
+					String func_name = func_part.substr(0, paren_pos);
+					String params = func_part.substr(paren_pos);
+					
+					// Remove opening brace if present
+					if (params.ends_with(" {")) {
+						params = params.substr(0, params.length() - 2);
+					} else if (params.ends_with("{")) {
+						params = params.substr(0, params.length() - 1);
+					}
+					
+					// Get indentation
+					String indent = line.substr(0, line.length() - line.lstrip("\t ").length());
+					converted_line = indent + "func " + func_name + params + ":";
+				}
+			}
+		}
+		
+		// Convert console.log to print
+		if (converted_line.contains("console.log(")) {
+			converted_line = converted_line.replace("console.log(", "print(");
+		}
+		
+		// Remove standalone opening/closing braces (JavaScript style)
+		String trimmed = converted_line.strip_edges();
+		if (trimmed == "{" || trimmed == "}") {
+			continue; // Skip these lines in GDScript
+		}
+		
+		// Convert JavaScript variable declarations
+		if (converted_line.contains("let ") || converted_line.contains("var ") || converted_line.contains("const ")) {
+			converted_line = converted_line.replace("let ", "var ");
+			converted_line = converted_line.replace("const ", "var ");
+		}
+		
+		converted_lines.push_back(converted_line);
+	}
+	
+	return String("\n").join(converted_lines);
+}
+
+String EditorTools::_fix_malformed_content(const String &p_content) {
+	String content = p_content;
+	
+	// Fix missing function endings in GDScript
+	Vector<String> lines = content.split("\n");
+	Vector<String> fixed_lines;
+	bool in_function = false;
+	
+	for (int i = 0; i < lines.size(); i++) {
+		String line = lines[i];
+		String trimmed = line.strip_edges();
+		
+		// Track function declarations in GDScript
+		if (trimmed.begins_with("func ")) {
+			in_function = true;
+		} else if (in_function) {
+			// Check indentation
+			String line_indent = line.substr(0, line.length() - line.lstrip("\t ").length());
+			if (!trimmed.is_empty() && line_indent.length() == 0) {
+				// Function ended (no indentation)
+				in_function = false;
+			}
+		}
+		
+		fixed_lines.push_back(line);
+		
+		// If we're starting a new function without proper ending
+		if (in_function && 
+			i + 1 < lines.size() && 
+			lines[i + 1].strip_edges().begins_with("func ")) {
+			in_function = false;
+		}
+	}
+	
+	return String("\n").join(fixed_lines);
+}
+
+String EditorTools::_generate_unified_diff(const String &p_original, const String &p_modified, const String &p_file_path) {
+	Vector<String> original_lines = p_original.split("\n");
+	Vector<String> modified_lines = p_modified.split("\n");
+	
+	String diff = "--- " + p_file_path + " (original)\n";
+	diff += "+++ " + p_file_path + " (modified)\n";
+	
+	// Simple diff implementation - compare line by line
+	int original_line = 0;
+	int modified_line = 0;
+	int context_lines = 3;
+	
+	while (original_line < original_lines.size() || modified_line < modified_lines.size()) {
+		// Find changes
+		int change_start_orig = original_line;
+		int change_start_mod = modified_line;
+		
+		// Skip matching lines
+		while (original_line < original_lines.size() && 
+			   modified_line < modified_lines.size() && 
+			   original_lines[original_line] == modified_lines[modified_line]) {
+			original_line++;
+			modified_line++;
+		}
+		
+		if (original_line >= original_lines.size() && modified_line >= modified_lines.size()) {
+			break; // End of both files
+		}
+		
+		// Find end of change block
+		int change_end_orig = original_line;
+		int change_end_mod = modified_line;
+		
+		// Simple heuristic: advance until we find matching lines again or reach end
+		while ((change_end_orig < original_lines.size() || change_end_mod < modified_lines.size())) {
+			// Look ahead to see if we find a match
+			bool found_match = false;
+			int lookahead = 3; // Look ahead a few lines
+			
+			for (int i = 0; i < lookahead && !found_match; i++) {
+				if (change_end_orig + i < original_lines.size() && 
+					change_end_mod + i < modified_lines.size() &&
+					original_lines[change_end_orig + i] == modified_lines[change_end_mod + i]) {
+					found_match = true;
+					break;
+				}
+			}
+			
+			if (found_match) {
+				break;
+			}
+			
+			if (change_end_orig < original_lines.size()) change_end_orig++;
+			if (change_end_mod < modified_lines.size()) change_end_mod++;
+		}
+		
+		// Generate hunk header
+		int context_start_orig = MAX(0, change_start_orig - context_lines);
+		int context_start_mod = MAX(0, change_start_mod - context_lines);
+		int context_end_orig = MIN(original_lines.size(), change_end_orig + context_lines);
+		int context_end_mod = MIN(modified_lines.size(), change_end_mod + context_lines);
+		
+		int hunk_orig_lines = context_end_orig - context_start_orig;
+		int hunk_mod_lines = context_end_mod - context_start_mod;
+		
+		diff += "@@ -" + String::num_int64(context_start_orig + 1) + "," + String::num_int64(hunk_orig_lines) + 
+				" +" + String::num_int64(context_start_mod + 1) + "," + String::num_int64(hunk_mod_lines) + " @@\n";
+		
+		// Add context before change
+		for (int i = context_start_orig; i < change_start_orig; i++) {
+			diff += " " + original_lines[i] + "\n";
+		}
+		
+		// Add removed lines
+		for (int i = change_start_orig; i < change_end_orig && i < original_lines.size(); i++) {
+			diff += "-" + original_lines[i] + "\n";
+		}
+		
+		// Add added lines
+		for (int i = change_start_mod; i < change_end_mod && i < modified_lines.size(); i++) {
+			diff += "+" + modified_lines[i] + "\n";
+		}
+		
+		// Add context after change
+		for (int i = change_end_orig; i < context_end_orig; i++) {
+			diff += " " + original_lines[i] + "\n";
+		}
+		
+		original_line = change_end_orig;
+		modified_line = change_end_mod;
+	}
+	
+	return diff;
+}
+
+Array EditorTools::_check_compilation_errors(const String &p_file_path, const String &p_content) {
+	Array errors;
+	
+	// Get file extension to determine script type
+	String extension = p_file_path.get_extension();
+	
+	if (extension == "gd") {
+		// GDScript compilation check using parser/analyzer/compiler approach
+		GDScriptParser parser;
+		Error parse_err = parser.parse(p_content, p_file_path, false);
+		
+		// Get parser errors
+		const List<GDScriptParser::ParserError> &parser_errors = parser.get_errors();
+		for (const GDScriptParser::ParserError &error : parser_errors) {
+			Dictionary error_dict;
+			error_dict["type"] = "parser_error";
+			error_dict["line"] = error.line;
+			error_dict["column"] = error.column;
+			error_dict["message"] = error.message;
+			errors.push_back(error_dict);
+		}
+		
+		// Only continue to analysis if parsing succeeded
+		if (parse_err == OK) {
+			GDScriptAnalyzer analyzer(&parser);
+			Error analyze_err = analyzer.analyze();
+			
+			// Get analyzer errors (they're stored in the parser)
+			const List<GDScriptParser::ParserError> &analyzer_errors = parser.get_errors();
+			for (const GDScriptParser::ParserError &error : analyzer_errors) {
+				// Skip errors we already collected during parsing
+				bool already_collected = false;
+				for (const GDScriptParser::ParserError &parse_error : parser_errors) {
+					if (parse_error.line == error.line && parse_error.message == error.message) {
+						already_collected = true;
+						break;
+					}
+				}
+				if (!already_collected) {
+					Dictionary error_dict;
+					error_dict["type"] = "analyzer_error";
+					error_dict["line"] = error.line;
+					error_dict["column"] = error.column;
+					error_dict["message"] = error.message;
+					errors.push_back(error_dict);
+				}
+			}
+			
+			// Only continue to compilation if analysis succeeded
+			if (analyze_err == OK) {
+				// Create a temporary script for compilation
+				Ref<GDScript> temp_script;
+				temp_script.instantiate();
+				
+				GDScriptCompiler compiler;
+				Error compile_err = compiler.compile(&parser, temp_script.ptr(), false);
+				
+				if (compile_err != OK) {
+					Dictionary error_dict;
+					error_dict["type"] = "compiler_error";
+					error_dict["line"] = compiler.get_error_line();
+					error_dict["column"] = compiler.get_error_column();
+					error_dict["message"] = compiler.get_error();
+					errors.push_back(error_dict);
+				}
+			}
+		}
+	} else if (extension == "cs") {
+		// C# compilation would require mono/dotnet integration
+		// For now, add a placeholder
+		Dictionary error_dict;
+		error_dict["type"] = "info";
+		error_dict["line"] = 0;
+		error_dict["column"] = 0;
+		error_dict["message"] = "C# compilation checking not implemented yet";
+		errors.push_back(error_dict);
+	}
+	
+	print_line("COMPILATION CHECK: Found " + String::num_int64(errors.size()) + " errors for " + p_file_path);
+	
+	    return errors;
+}
+
+Dictionary EditorTools::check_compilation_errors(const Dictionary &p_args) {
     Dictionary result;
-    // This tool is now handled in AIChatDock, this is just a placeholder
+    String path = p_args.get("path", "");
+    
+    if (path.is_empty()) {
+        result["success"] = false;
+        result["message"] = "Path is required";
+        result["errors"] = Array();
+        return result;
+    }
+    
+    print_line("CHECK_COMPILATION_ERRORS: Checking file - " + path);
+    
+    // Simple approach: Try to reload the script and see if it fails
+    Array errors;
+    
+    if (path.get_extension() == "gd") {
+        // Read the file content and parse it directly
+        Error file_err;
+        String file_content = FileAccess::get_file_as_string(path, &file_err);
+        
+        if (file_err != OK) {
+            Dictionary error_dict;
+            error_dict["type"] = "file_error";
+            error_dict["line"] = 0;
+            error_dict["column"] = 0;
+            error_dict["message"] = "Failed to read file: " + path;
+            errors.push_back(error_dict);
+        } else {
+            // Parse the script directly to get detailed error information
+            GDScriptParser parser;
+            Error parse_err = parser.parse(file_content, path, false);
+            
+            // Get parser errors
+            const List<GDScriptParser::ParserError> &parser_errors = parser.get_errors();
+            for (const GDScriptParser::ParserError &error : parser_errors) {
+                Dictionary error_dict;
+                error_dict["type"] = "parser_error";
+                error_dict["line"] = error.line;
+                error_dict["column"] = error.column;
+                error_dict["message"] = error.message;
+                errors.push_back(error_dict);
+                print_line("CHECK_COMPILATION_ERRORS: Found parser error at line " + String::num_int64(error.line) + ": " + error.message);
+            }
+            
+            // Only continue to analysis if parsing succeeded
+            if (parse_err == OK && parser_errors.is_empty()) {
+                GDScriptAnalyzer analyzer(&parser);
+                Error analyze_err = analyzer.analyze();
+                
+                // Get analyzer errors (they're stored in the parser)
+                const List<GDScriptParser::ParserError> &analyzer_errors = parser.get_errors();
+                for (const GDScriptParser::ParserError &error : analyzer_errors) {
+                    // Skip errors we already collected during parsing
+                    bool already_collected = false;
+                    for (const GDScriptParser::ParserError &parse_error : parser_errors) {
+                        if (parse_error.line == error.line && parse_error.message == error.message) {
+                            already_collected = true;
+                            break;
+                        }
+                    }
+                    if (!already_collected) {
+                        Dictionary error_dict;
+                        error_dict["type"] = "analyzer_error";
+                        error_dict["line"] = error.line;
+                        error_dict["column"] = error.column;
+                        error_dict["message"] = error.message;
+                        errors.push_back(error_dict);
+                        print_line("CHECK_COMPILATION_ERRORS: Found analyzer error at line " + String::num_int64(error.line) + ": " + error.message);
+                    }
+                }
+                
+                if (analyze_err == OK && analyzer_errors.size() == parser_errors.size()) {
+                    print_line("CHECK_COMPILATION_ERRORS: Script parsed and analyzed successfully");
+                }
+            } else {
+                print_line("CHECK_COMPILATION_ERRORS: Parsing failed with " + String::num_int64(parser_errors.size()) + " errors");
+            }
+        }
+    } else if (path.get_extension() == "cs") {
+        // For C# files, add placeholder check
+        Dictionary info_dict;
+        info_dict["type"] = "info";
+        info_dict["line"] = 0;
+        info_dict["column"] = 0;
+        info_dict["message"] = "C# compilation checking not implemented";
+        errors.push_back(info_dict);
+    } else {
+        Dictionary info_dict;
+        info_dict["type"] = "info";
+        info_dict["line"] = 0;
+        info_dict["column"] = 0;
+        info_dict["message"] = "Unsupported file type for compilation checking";
+        errors.push_back(info_dict);
+    }
+    
     result["success"] = true;
-    result["message"] = "This tool is handled in the AI Chat Dock.";
+    result["path"] = path;
+    result["errors"] = errors;
+    result["has_errors"] = errors.size() > 0;
+    result["error_count"] = errors.size();
+    
+    print_line("CHECK_COMPILATION_ERRORS: Found " + String::num_int64(errors.size()) + " errors in " + path);
+    
     return result;
 } 

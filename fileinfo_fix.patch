@@ -1507,7 +1507,7 @@ index 0000000000..ac2ffb5cf6
 +				if (!prediction.get("success", false)) {
 +					result = prediction;
 +				} else {
-+					String new_content = prediction["new_content"];
++					String new_content = prediction["edited_content"];
 +					diff_viewer->set_diff(path, file_content, new_content);
 +					
 +					// Check if the script is open in the editor

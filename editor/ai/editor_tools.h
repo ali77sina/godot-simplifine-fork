@@ -15,6 +15,12 @@ private:
 
 public:
     static Dictionary _predict_code_edit(const String &p_file_content, const String &p_prompt, const String &p_api_endpoint);
+    	static Dictionary _call_apply_endpoint(const String &p_file_path, const String &p_file_content, const Dictionary &p_ai_args, const String &p_api_endpoint);
+	static String _clean_backend_content(const String &p_content);
+	static String _convert_javascript_to_gdscript(const String &p_content);
+	static String _fix_malformed_content(const String &p_content);
+	static String _generate_unified_diff(const String &p_original, const String &p_modified, const String &p_file_path);
+	static Array _check_compilation_errors(const String &p_file_path, const String &p_content);
     static void set_api_endpoint(const String &p_endpoint);
 
 	static Dictionary get_scene_info(const Dictionary &p_args);
@@ -40,4 +46,5 @@ public:
 	static Dictionary read_file_content(const Dictionary &p_args);
 	static Dictionary read_file_advanced(const Dictionary &p_args);
 	static Dictionary apply_edit(const Dictionary &p_args);
+	static Dictionary check_compilation_errors(const Dictionary &p_args);
 }; 
