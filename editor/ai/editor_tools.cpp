@@ -6,11 +6,13 @@
 #include "core/io/http_client.h"
 #include "core/io/json.h"
 #include "core/io/resource_loader.h"
+#include "core/config/project_settings.h"
 #include "editor/editor_data.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
 #include "editor/docks/scene_tree_dock.h"
+#include "editor/run/editor_run_bar.h"
 #include "editor/script/script_editor_plugin.h"
 #include "editor/script/script_text_editor.h"
 #include "scene/main/node.h"
@@ -33,8 +35,21 @@ Dictionary EditorTools::_get_node_info(Node *p_node) {
 	}
 	node_info["name"] = p_node->get_name();
 	node_info["type"] = p_node->get_class();
-	node_info["path"] = p_node->get_path();
-	node_info["owner"] = p_node->get_owner() ? p_node->get_owner()->get_path() : String();
+	
+	// Get scene-relative path instead of absolute path
+	Node *scene_root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+	if (scene_root && p_node == scene_root) {
+		// This is the scene root itself
+		node_info["path"] = p_node->get_name();
+	} else if (scene_root && scene_root->is_ancestor_of(p_node)) {
+		// Get relative path from scene root
+		node_info["path"] = scene_root->get_path_to(p_node);
+	} else {
+		// Fallback to absolute path if not in scene tree
+		node_info["path"] = p_node->get_path();
+	}
+	
+	node_info["owner"] = p_node->get_owner() ? String(p_node->get_owner()->get_name()) : String();
 	node_info["child_count"] = p_node->get_child_count();
 	return node_info;
 }
@@ -109,13 +124,21 @@ Dictionary EditorTools::search_nodes_by_type(const Dictionary &p_args) {
 	Array nodes;
 	Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
 	if (root) {
-		List<Node *> node_list;
-		root->get_tree()->get_nodes_in_group("_scenetree", &node_list);
-		for (Node *node : node_list) {
-			if (node->is_class(type)) {
-				nodes.push_back(_get_node_info(node));
+		// Helper lambda to recursively search all nodes
+		std::function<void(Node*)> search_nodes = [&](Node* node) {
+			if (node) {
+				if (node->is_class(type)) {
+					nodes.push_back(_get_node_info(node));
+				}
+				// Recursively search all children
+				for (int i = 0; i < node->get_child_count(); i++) {
+					search_nodes(node->get_child(i));
+				}
 			}
-		}
+		};
+		
+		// Start searching from the root
+		search_nodes(root);
 	}
 	result["success"] = true;
 	result["nodes"] = nodes;
@@ -1788,4 +1811,463 @@ Dictionary EditorTools::check_compilation_errors(const Dictionary &p_args) {
     print_line("CHECK_COMPILATION_ERRORS: Found " + String::num_int64(errors.size()) + " errors in " + path);
     
     return result;
+}
+
+// --- Universal Tools Implementation ---
+
+Dictionary EditorTools::universal_node_manager(const Dictionary &p_args) {
+	String operation = p_args.get("operation", "");
+	
+	if (operation == "create") return create_node(p_args);
+	if (operation == "delete") return delete_node(p_args);
+	if (operation == "move") return move_node(p_args);
+	if (operation == "set_property") return set_node_property(p_args);
+	if (operation == "get_info") return get_all_nodes(p_args);
+	if (operation == "search") return search_nodes_by_type(p_args);
+	if (operation == "select") return get_editor_selection(p_args);
+	if (operation == "get_properties") return get_node_properties(p_args);
+	if (operation == "call_method") return call_node_method(p_args);
+	if (operation == "get_script") return get_node_script(p_args);
+	if (operation == "attach_script") return attach_script(p_args);
+	if (operation == "add_collision") return add_collision_shape(p_args);
+	
+	Dictionary result;
+	result["success"] = false;
+	result["message"] = "Unknown node operation: " + operation;
+	return result;
+}
+
+Dictionary EditorTools::universal_file_manager(const Dictionary &p_args) {
+	String operation = p_args.get("operation", "");
+	
+	if (operation == "read") {
+		if (p_args.has("start_line") || p_args.has("end_line")) {
+			return read_file_advanced(p_args);
+		} else {
+			return read_file_content(p_args);
+		}
+	}
+	if (operation == "list") return list_project_files(p_args);
+	if (operation == "apply_ai_edit") return apply_edit(p_args);
+	if (operation == "check_compilation") return check_compilation_errors(p_args);
+	if (operation == "get_classes") return get_available_classes(p_args);
+
+	Dictionary result;
+	result["success"] = false;
+	result["message"] = "Unknown file operation: " + operation;
+	return result;
+}
+
+Dictionary EditorTools::scene_manager(const Dictionary &p_args) {
+	String operation = p_args.get("operation", "");
+	
+	if (operation == "save") return save_scene(p_args);
+	if (operation == "get_info") return get_scene_info(p_args);
+	if (operation == "open" || operation == "create_new" || operation == "save_as" || operation == "instantiate") {
+		return manage_scene(p_args);
+	}
+	
+	Dictionary result;
+	result["success"] = false;
+	result["message"] = "Unknown scene operation: " + operation;
+	return result;
+}
+
+// --- New Debugging Tools Implementation ---
+
+Dictionary EditorTools::run_scene(const Dictionary &p_args) {
+	Dictionary result;
+	String scene_path = p_args.get("scene_path", "");
+	int duration = p_args.get("duration", 5);
+	
+	// Get the current scene if no path specified
+	if (scene_path.is_empty()) {
+		Node *current_scene = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+		if (current_scene) {
+			scene_path = current_scene->get_scene_file_path();
+		}
+	}
+	
+	if (scene_path.is_empty()) {
+		result["success"] = false;
+		result["message"] = "No scene to run";
+		return result;
+	}
+	
+	// Start the scene
+	EditorRunBar::get_singleton()->play_custom_scene(scene_path);
+	
+	result["success"] = true;
+	result["message"] = "Scene started: " + scene_path;
+	result["scene_path"] = scene_path;
+	result["duration"] = duration;
+	return result;
+}
+
+Dictionary EditorTools::get_scene_tree_hierarchy(const Dictionary &p_args) {
+	Dictionary result;
+	bool include_properties = p_args.get("include_properties", false);
+	
+	Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+	if (!root) {
+		result["success"] = false;
+		result["message"] = "No scene is currently being edited.";
+		return result;
+	}
+	
+	// Recursive function to build hierarchy
+	std::function<Dictionary(Node*)> build_hierarchy = [&](Node* node) -> Dictionary {
+		Dictionary node_dict;
+		if (!node) return node_dict;
+		
+		node_dict["name"] = node->get_name();
+		node_dict["type"] = node->get_class();
+		node_dict["path"] = root->get_path_to(node);
+		
+		if (include_properties) {
+			List<PropertyInfo> properties;
+			node->get_property_list(&properties);
+			Dictionary props_dict;
+			for (const PropertyInfo &prop_info : properties) {
+				if (prop_info.usage & PROPERTY_USAGE_EDITOR) {
+					props_dict[prop_info.name] = node->get(prop_info.name);
+				}
+			}
+			node_dict["properties"] = props_dict;
+		}
+		
+		// Add children recursively
+		Array children;
+		for (int i = 0; i < node->get_child_count(); i++) {
+			children.push_back(build_hierarchy(node->get_child(i)));
+		}
+		node_dict["children"] = children;
+		node_dict["child_count"] = node->get_child_count();
+		
+		return node_dict;
+	};
+	
+	result["success"] = true;
+	result["hierarchy"] = build_hierarchy(root);
+	result["include_properties"] = include_properties;
+	return result;
+}
+
+Dictionary EditorTools::inspect_physics_body(const Dictionary &p_args) {
+	Dictionary result;
+	if (!p_args.has("path")) {
+		result["success"] = false;
+		result["message"] = "Missing 'path' argument.";
+		return result;
+	}
+	
+	Node *node = _get_node_from_path(p_args["path"], result);
+	if (!node) {
+		return result;
+	}
+	
+	Dictionary physics_info;
+	physics_info["node_name"] = node->get_name();
+	physics_info["node_type"] = node->get_class();
+	
+	// Check if it's a physics body
+	if (node->is_class("RigidBody2D") || node->is_class("CharacterBody2D") || 
+		node->is_class("StaticBody2D") || node->is_class("AnimatableBody2D") ||
+		node->is_class("RigidBody3D") || node->is_class("CharacterBody3D") ||
+		node->is_class("StaticBody3D") || node->is_class("AnimatableBody3D")) {
+		
+		physics_info["is_physics_body"] = true;
+		
+		// Get physics properties
+		physics_info["collision_layer"] = node->get("collision_layer");
+		physics_info["collision_mask"] = node->get("collision_mask");
+		
+		if (node->is_class("RigidBody2D") || node->is_class("RigidBody3D")) {
+			physics_info["mass"] = node->get("mass");
+			physics_info["gravity_scale"] = node->get("gravity_scale");
+			physics_info["linear_velocity"] = node->get("linear_velocity");
+			physics_info["angular_velocity"] = node->get("angular_velocity");
+		}
+		
+		// Check for collision shapes
+		Array collision_shapes;
+		for (int i = 0; i < node->get_child_count(); i++) {
+			Node *child = node->get_child(i);
+			if (child->is_class("CollisionShape2D") || child->is_class("CollisionShape3D")) {
+				Dictionary shape_info;
+				shape_info["name"] = child->get_name();
+				shape_info["type"] = child->get_class();
+				shape_info["disabled"] = child->get("disabled");
+				collision_shapes.push_back(shape_info);
+			}
+		}
+		physics_info["collision_shapes"] = collision_shapes;
+		
+	} else {
+		physics_info["is_physics_body"] = false;
+		physics_info["message"] = "Node is not a physics body";
+	}
+	
+	result["success"] = true;
+	result["physics_info"] = physics_info;
+	return result;
+}
+
+Dictionary EditorTools::get_camera_info(const Dictionary &p_args) {
+	Dictionary result;
+	String camera_path = p_args.get("camera_path", "");
+	
+	Node *camera = nullptr;
+	Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+	
+	if (!camera_path.is_empty()) {
+		camera = _get_node_from_path(camera_path, result);
+		if (!camera) {
+			return result;
+		}
+	} else if (root) {
+		// Find first camera in the scene
+		std::function<Node*(Node*)> find_camera = [&](Node* node) -> Node* {
+			if (node->is_class("Camera2D") || node->is_class("Camera3D")) {
+				return node;
+			}
+			for (int i = 0; i < node->get_child_count(); i++) {
+				Node *found = find_camera(node->get_child(i));
+				if (found) return found;
+			}
+			return nullptr;
+		};
+		camera = find_camera(root);
+	}
+	
+	if (!camera) {
+		result["success"] = false;
+		result["message"] = "No camera found";
+		return result;
+	}
+	
+	Dictionary camera_info;
+	camera_info["name"] = camera->get_name();
+	camera_info["type"] = camera->get_class();
+	camera_info["path"] = root ? root->get_path_to(camera) : camera->get_path();
+	camera_info["position"] = camera->get("position");
+	camera_info["enabled"] = camera->get("enabled");
+	
+	if (camera->is_class("Camera2D")) {
+		camera_info["zoom"] = camera->get("zoom");
+		camera_info["offset"] = camera->get("offset");
+		camera_info["limit_left"] = camera->get("limit_left");
+		camera_info["limit_right"] = camera->get("limit_right");
+		camera_info["limit_top"] = camera->get("limit_top");
+		camera_info["limit_bottom"] = camera->get("limit_bottom");
+	}
+	
+	result["success"] = true;
+	result["camera_info"] = camera_info;
+	return result;
+}
+
+Dictionary EditorTools::take_screenshot(const Dictionary &p_args) {
+	Dictionary result;
+	String filename = p_args.get("filename", "screenshot_debug.png");
+	
+	// Try to get the main viewport
+	Viewport *viewport = EditorNode::get_singleton()->get_viewport();
+	if (!viewport) {
+		result["success"] = false;
+		result["message"] = "Could not access viewport";
+		return result;
+	}
+	
+	// Take screenshot
+	Ref<Image> screenshot = viewport->get_texture()->get_image();
+	if (screenshot.is_null()) {
+		result["success"] = false;
+		result["message"] = "Failed to capture screenshot";
+		return result;
+	}
+	
+	// Save to project directory
+	String project_path = ProjectSettings::get_singleton()->globalize_path("res://");
+	String full_path = project_path + "/" + filename;
+	
+	Error save_result = screenshot->save_png(full_path);
+	if (save_result != OK) {
+		result["success"] = false;
+		result["message"] = "Failed to save screenshot: " + String::num_int64(save_result);
+		return result;
+	}
+	
+	result["success"] = true;
+	result["message"] = "Screenshot saved";
+	result["filename"] = filename;
+	result["path"] = full_path;
+	return result;
+}
+
+Dictionary EditorTools::check_node_in_scene_tree(const Dictionary &p_args) {
+	Dictionary result;
+	if (!p_args.has("path")) {
+		result["success"] = false;
+		result["message"] = "Missing 'path' argument.";
+		return result;
+	}
+	
+	Node *node = _get_node_from_path(p_args["path"], result);
+	if (!node) {
+		return result;
+	}
+	
+	Dictionary node_status;
+	node_status["exists"] = true;
+	node_status["name"] = node->get_name();
+	node_status["type"] = node->get_class();
+	node_status["is_inside_tree"] = node->is_inside_tree();
+	node_status["is_ready"] = node->is_ready();
+	node_status["process_mode"] = node->get("process_mode");
+	
+	Node *parent = node->get_parent();
+	if (parent) {
+		node_status["parent_name"] = parent->get_name();
+		node_status["parent_type"] = parent->get_class();
+	} else {
+		node_status["parent_name"] = "";
+		node_status["parent_type"] = "";
+	}
+	
+	node_status["child_count"] = node->get_child_count();
+	node_status["visible"] = node->has_method("is_visible") ? node->call("is_visible") : Variant();
+	
+	result["success"] = true;
+	result["node_status"] = node_status;
+	return result;
+}
+
+Dictionary EditorTools::inspect_animation_state(const Dictionary &p_args) {
+	Dictionary result;
+	if (!p_args.has("path")) {
+		result["success"] = false;
+		result["message"] = "Missing 'path' argument.";
+		return result;
+	}
+	
+	Node *node = _get_node_from_path(p_args["path"], result);
+	if (!node) {
+		return result;
+	}
+	
+	Dictionary animation_info;
+	animation_info["node_name"] = node->get_name();
+	animation_info["node_type"] = node->get_class();
+	
+	if (node->is_class("AnimationPlayer")) {
+		animation_info["is_animation_player"] = true;
+		animation_info["current_animation"] = node->get("current_animation");
+		animation_info["is_playing"] = node->call("is_playing");
+		animation_info["playback_speed"] = node->get("playback_speed");
+		
+		// Get list of animations
+		Array animation_list;
+		Variant animations = node->call("get_animation_list");
+		if (animations.get_type() == Variant::ARRAY) {
+			animation_list = animations;
+		}
+		animation_info["available_animations"] = animation_list;
+		
+	} else if (node->is_class("AnimatedSprite2D") || node->is_class("AnimatedSprite3D")) {
+		animation_info["is_animated_sprite"] = true;
+		animation_info["animation"] = node->get("animation");
+		animation_info["frame"] = node->get("frame");
+		animation_info["playing"] = node->call("is_playing");
+		animation_info["speed_scale"] = node->get("speed_scale");
+		
+	} else {
+		animation_info["is_animated"] = false;
+		animation_info["message"] = "Node is not an animation node";
+	}
+	
+	result["success"] = true;
+	result["animation_info"] = animation_info;
+	return result;
+}
+
+Dictionary EditorTools::get_layers_and_zindex(const Dictionary &p_args) {
+	Dictionary result;
+	String path = p_args.get("path", "");
+	
+	Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+	if (!root) {
+		result["success"] = false;
+		result["message"] = "No scene is currently being edited.";
+		return result;
+	}
+	
+	Array layer_info;
+	
+	if (!path.is_empty()) {
+		// Get info for specific node
+		Node *node = _get_node_from_path(path, result);
+		if (!node) {
+			return result;
+		}
+		
+		Dictionary node_layer_info;
+		node_layer_info["name"] = node->get_name();
+		node_layer_info["type"] = node->get_class();
+		node_layer_info["path"] = root->get_path_to(node);
+		
+		if (node->has_method("get_z_index")) {
+			node_layer_info["z_index"] = node->call("get_z_index");
+		}
+		if (node->has_method("get_z_as_relative")) {
+			node_layer_info["z_as_relative"] = node->call("get_z_as_relative");
+		}
+		if (node->is_class("CanvasLayer")) {
+			node_layer_info["layer"] = node->get("layer");
+		}
+		
+		layer_info.push_back(node_layer_info);
+		
+	} else {
+		// Get info for all nodes with layer/z-index properties
+		std::function<void(Node*)> collect_layer_nodes = [&](Node* node) {
+			if (node) {
+				Dictionary node_layer_info;
+				bool has_layer_info = false;
+				
+				node_layer_info["name"] = node->get_name();
+				node_layer_info["type"] = node->get_class();
+				node_layer_info["path"] = root->get_path_to(node);
+				
+				if (node->has_method("get_z_index")) {
+					node_layer_info["z_index"] = node->call("get_z_index");
+					has_layer_info = true;
+				}
+				if (node->has_method("get_z_as_relative")) {
+					node_layer_info["z_as_relative"] = node->call("get_z_as_relative");
+					has_layer_info = true;
+				}
+				if (node->is_class("CanvasLayer")) {
+					node_layer_info["layer"] = node->get("layer");
+					has_layer_info = true;
+				}
+				
+				if (has_layer_info) {
+					layer_info.push_back(node_layer_info);
+				}
+				
+				// Recursively check children
+				for (int i = 0; i < node->get_child_count(); i++) {
+					collect_layer_nodes(node->get_child(i));
+				}
+			}
+		};
+		
+		collect_layer_nodes(root);
+	}
+	
+	result["success"] = true;
+	result["layer_info"] = layer_info;
+	result["node_count"] = layer_info.size();
+	return result;
 } 

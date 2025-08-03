@@ -64,6 +64,8 @@
 #include "scene/gui/dialogs.h"
 #include "scene/main/http_request.h"
 #include "scene/resources/style_box_flat.h"
+#include "scene/2d/node_2d.h"
+#include "scene/3d/node_3d.h"
 #include "core/string/string_name.h"
 
 #include "../ai/editor_tools.h"
@@ -81,6 +83,8 @@ void AIChatDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_on_remove_attachment", "path"), &AIChatDock::_on_remove_attachment);
 	ClassDB::bind_method(D_METHOD("_on_conversation_selected"), &AIChatDock::_on_conversation_selected);
 	ClassDB::bind_method(D_METHOD("_on_new_conversation_pressed"), &AIChatDock::_on_new_conversation_pressed);
+	ClassDB::bind_method(D_METHOD("_on_save_image_pressed", "base64_data", "format"), &AIChatDock::_on_save_image_pressed);
+	ClassDB::bind_method(D_METHOD("_on_save_image_location_selected"), &AIChatDock::_on_save_image_location_selected);
 	ClassDB::bind_method(D_METHOD("_display_generated_image_deferred", "base64_data", "id"), &AIChatDock::_display_generated_image_deferred);
 }
 
@@ -109,7 +113,7 @@ void AIChatDock::_notification(int p_notification) {
 			new_conversation_button->connect("pressed", callable_mp(this, &AIChatDock::_on_new_conversation_pressed));
 			history_container->add_child(new_conversation_button);
 
-			// Model selection and attach button row
+			// Model selection row
 			HBoxContainer *top_container = memnew(HBoxContainer);
 			add_child(top_container);
 
@@ -125,17 +129,11 @@ void AIChatDock::_notification(int p_notification) {
 			model_dropdown->connect("item_selected", callable_mp(this, &AIChatDock::_on_model_selected));
 			top_container->add_child(model_dropdown);
 
-			// Attach files button
-			attach_button = memnew(Button);
-			attach_button->set_text("Attach Files");
-			attach_button->set_tooltip_text("Attach project files to your message");
-			attach_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Folder"), SNAME("EditorIcons")));
-			attach_button->connect("pressed", callable_mp(this, &AIChatDock::_on_attach_button_pressed));
-			top_container->add_child(attach_button);
-
 			// Container for attached files (initially hidden)
 			attached_files_container = memnew(HFlowContainer);
 			attached_files_container->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			attached_files_container->add_theme_constant_override("h_separation", 6); // Horizontal spacing between attachment tabs
+			attached_files_container->add_theme_constant_override("v_separation", 4); // Vertical spacing if wrapping
 			attached_files_container->set_visible(false);
 			add_child(attached_files_container);
 
@@ -157,6 +155,15 @@ void AIChatDock::_notification(int p_notification) {
 		image_warning_dialog->set_title("Image Downsampled");
 		add_child(image_warning_dialog);
 
+		// Create save image dialog
+		save_image_dialog = memnew(EditorFileDialog);
+		save_image_dialog->set_file_mode(EditorFileDialog::FILE_MODE_SAVE_FILE);
+		save_image_dialog->set_access(EditorFileDialog::ACCESS_RESOURCES);
+		save_image_dialog->add_filter("*.png", "PNG Images");
+		save_image_dialog->add_filter("*.jpg", "JPEG Images");
+		save_image_dialog->connect("files_selected", callable_mp(this, &AIChatDock::_on_save_image_location_selected));
+		add_child(save_image_dialog);
+
 			// Chat history area - expand to fill available space
 			chat_scroll = memnew(ScrollContainer);
 			chat_scroll->set_v_size_flags(Control::SIZE_EXPAND_FILL);
@@ -167,16 +174,52 @@ void AIChatDock::_notification(int p_notification) {
 			chat_container->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 			chat_scroll->add_child(chat_container);
 
+			// Attach files button row (above input)
+			HBoxContainer *attach_container = memnew(HBoxContainer);
+			add_child(attach_container);
+
+			// Add spacer to push button to the right
+			Control *spacer = memnew(Control);
+			spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+			attach_container->add_child(spacer);
+
+			// Attach files button
+			attach_button = memnew(Button);
+			attach_button->set_text("Attach");
+			attach_button->set_tooltip_text("Attach project files to your message");
+			attach_button->add_theme_icon_override("icon", get_theme_icon(SNAME("FileList"), SNAME("EditorIcons")));
+			attach_button->set_custom_minimum_size(Size2(80, 32));
+			attach_button->connect("pressed", callable_mp(this, &AIChatDock::_on_attach_button_pressed));
+			attach_container->add_child(attach_button);
+
+			// Add some spacing before input area
+			Control *input_spacer = memnew(Control);
+			input_spacer->set_custom_minimum_size(Size2(0, 4));
+			add_child(input_spacer);
+
 			// Input area at the bottom
 			HBoxContainer *input_container = memnew(HBoxContainer);
+			input_container->add_theme_constant_override("separation", 8); // Gap between input and send button
 			add_child(input_container);
 
 			input_field = memnew(TextEdit);
 			Ref<StyleBoxFlat> input_style = memnew(StyleBoxFlat);
 			input_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
-			input_style->set_border_width_all(1);
+			input_style->set_border_width_all(2);
 			input_style->set_border_color(get_theme_color(SNAME("dark_color_3"), SNAME("Editor")));
+			input_style->set_corner_radius_all(8); // Modern rounded input
+			input_style->set_content_margin_all(8); // Better inner padding
 			input_field->add_theme_style_override("normal", input_style);
+			
+			// Focus style for modern interaction
+			Ref<StyleBoxFlat> input_focus_style = memnew(StyleBoxFlat);
+			input_focus_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
+			input_focus_style->set_border_width_all(2);
+			input_focus_style->set_border_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
+			input_focus_style->set_corner_radius_all(8);
+			input_focus_style->set_content_margin_all(8);
+			input_field->add_theme_style_override("focus", input_focus_style);
+			
 			input_field->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 			input_field->set_v_size_flags(Control::SIZE_SHRINK_CENTER);
 			input_field->set_placeholder("Ask me anything about Godot...");
@@ -188,6 +231,23 @@ void AIChatDock::_notification(int p_notification) {
 			send_button = memnew(Button);
 			send_button->set_text("Send");
 			send_button->set_disabled(true);
+			send_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Play"), SNAME("EditorIcons")));
+			send_button->set_custom_minimum_size(Size2(80, 40));
+			
+			// Modern button styling
+			Ref<StyleBoxFlat> button_style = memnew(StyleBoxFlat);
+			button_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+			button_style->set_corner_radius_all(6);
+			button_style->set_content_margin_all(8);
+			send_button->add_theme_style_override("normal", button_style);
+			
+			// Hover style
+			Ref<StyleBoxFlat> button_hover_style = memnew(StyleBoxFlat);
+			button_hover_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1.1, 1.1, 1.1));
+			button_hover_style->set_corner_radius_all(6);
+			button_hover_style->set_content_margin_all(8);
+			send_button->add_theme_style_override("hover", button_hover_style);
+			
 			send_button->connect("pressed", callable_mp(this, &AIChatDock::_on_send_button_pressed));
 			input_container->add_child(send_button);
 
@@ -399,114 +459,354 @@ void AIChatDock::_update_attached_files_display() {
 		PanelContainer *file_chip = memnew(PanelContainer);
 		attached_files_container->add_child(file_chip);
 		
-		// Enhanced styling for better aesthetics
+		// Modern tab-like styling
 		Ref<StyleBoxFlat> chip_style = memnew(StyleBoxFlat);
-		if (file.is_image) {
-			// Special styling for images
-			chip_style->set_bg_color(get_theme_color(SNAME("success_color"), SNAME("Editor")) * Color(1, 1, 1, 0.15));
-			chip_style->set_border_color(get_theme_color(SNAME("success_color"), SNAME("Editor")));
-		} else {
-			chip_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.15));
-			chip_style->set_border_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-		}
+		// Subtle background with modern styling
+		chip_style->set_bg_color(get_theme_color(SNAME("dark_color_2"), SNAME("Editor")));
 		chip_style->set_border_width_all(1);
-		chip_style->set_corner_radius_all(8);
-		chip_style->set_content_margin_all(8);
-		chip_style->set_shadow_color(Color(0, 0, 0, 0.1));
-		chip_style->set_shadow_size(2);
+		chip_style->set_border_color(get_theme_color(SNAME("dark_color_3"), SNAME("Editor")));
+		chip_style->set_corner_radius_all(6); // More modern rounded corners
+		chip_style->set_content_margin(SIDE_TOP, 2);
+		chip_style->set_content_margin(SIDE_RIGHT, 6);
+		chip_style->set_content_margin(SIDE_BOTTOM, 2);
+		chip_style->set_content_margin(SIDE_LEFT, 6);
+		chip_style->set_shadow_color(Color(0, 0, 0, 0.15));
+		chip_style->set_shadow_size(1);
 		file_chip->add_theme_style_override("panel", chip_style);
 		
-		if (file.is_image) {
-			// Create vertical layout for images
-			VBoxContainer *chip_container = memnew(VBoxContainer);
-			file_chip->add_child(chip_container);
-			
-			// Image preview
-			if (!file.base64_data.is_empty()) {
-				Vector<uint8_t> image_data = CoreBind::Marshalls::get_singleton()->base64_to_raw(file.base64_data);
-				if (image_data.size() > 0) {
-					Ref<Image> preview_image = memnew(Image);
-					if (file.mime_type == "image/jpeg" || file.mime_type == "image/jpg") {
-						preview_image->load_jpg_from_buffer(image_data);
-					} else {
-						preview_image->load_png_from_buffer(image_data);
-					}
-					
-					if (!preview_image->is_empty()) {
-						// Create thumbnail (max 64px)
-						Vector2i thumb_size = _calculate_downsampled_size(file.display_size, 64);
-						preview_image->resize(thumb_size.x, thumb_size.y, Image::INTERPOLATE_LANCZOS);
-						
-						Ref<ImageTexture> preview_texture = ImageTexture::create_from_image(preview_image);
-						
-						TextureRect *image_preview = memnew(TextureRect);
-						image_preview->set_texture(preview_texture);
-						image_preview->set_expand_mode(TextureRect::EXPAND_FIT_WIDTH_PROPORTIONAL);
-						image_preview->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
-						image_preview->set_custom_minimum_size(Size2(64, 64));
-						chip_container->add_child(image_preview);
-					}
-				}
-			}
-			
-			// File info container
-			HBoxContainer *info_container = memnew(HBoxContainer);
-			chip_container->add_child(info_container);
-			
-			VBoxContainer *file_info = memnew(VBoxContainer);
-			info_container->add_child(file_info);
-			
-			Label *file_label = memnew(Label);
-			file_label->set_text(file.name);
-			file_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
-			file_label->add_theme_color_override("font_color", get_theme_color(SNAME("success_color"), SNAME("Editor")));
-			file_info->add_child(file_label);
-			
-			Label *size_label = memnew(Label);
-			String size_text = String::num_int64(file.display_size.x) + "×" + String::num_int64(file.display_size.y);
-			if (file.was_downsampled) {
-				size_text += " (resized)";
-			}
-			size_label->set_text(size_text);
-			size_label->add_theme_font_size_override("font_size", 10);
-			size_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
-			file_info->add_child(size_label);
-			
-			// Remove button
-			Button *remove_button = memnew(Button);
-			remove_button->set_text("×");
-			remove_button->set_flat(true);
-			remove_button->add_theme_font_size_override("font_size", 16);
-			remove_button->add_theme_color_override("font_color", get_theme_color(SNAME("error_color"), SNAME("Editor")));
-			remove_button->set_tooltip_text("Remove " + file.name);
-			remove_button->connect("pressed", callable_mp(this, &AIChatDock::_on_remove_attachment).bind(file.path));
-			info_container->add_child(remove_button);
-		} else {
-			// Standard horizontal layout for text files
-			HBoxContainer *chip_container = memnew(HBoxContainer);
-			file_chip->add_child(chip_container);
-			
-			Label *file_label = memnew(Label);
-			file_label->set_text(file.name);
-			file_label->add_theme_icon_override("icon", get_theme_icon(SNAME("File"), SNAME("EditorIcons")));
-			file_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
-			chip_container->add_child(file_label);
-			
-			Button *remove_button = memnew(Button);
-			remove_button->set_text("×");
-			remove_button->set_flat(true);
-			remove_button->add_theme_font_size_override("font_size", 16);
-			remove_button->add_theme_color_override("font_color", get_theme_color(SNAME("error_color"), SNAME("Editor")));
-			remove_button->set_tooltip_text("Remove " + file.name);
-			remove_button->connect("pressed", callable_mp(this, &AIChatDock::_on_remove_attachment).bind(file.path));
-			chip_container->add_child(remove_button);
+		// Create compact tab-like attachment for both images and files
+		HBoxContainer *chip_container = memnew(HBoxContainer);
+		chip_container->set_custom_minimum_size(Size2(0, 32)); // Fixed height for consistent tabs
+		file_chip->add_child(chip_container);
+		
+		// File type icon (different icons for different file types)
+		Label *file_icon = memnew(Label);
+		String icon_name = _get_file_type_icon(file);
+		file_icon->add_theme_icon_override("icon", get_theme_icon(icon_name, SNAME("EditorIcons")));
+		chip_container->add_child(file_icon);
+		
+		// File name label (truncated if too long)
+		Label *file_label = memnew(Label);
+		String display_name = file.name;
+		if (display_name.length() > 20) {
+			display_name = display_name.substr(0, 17) + "...";
 		}
+		file_label->set_text(display_name);
+		file_label->add_theme_font_size_override("font_size", 12);
+		file_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")));
+		file_label->set_clip_contents(true);
+		file_label->set_tooltip_text(file.name);
+		chip_container->add_child(file_label);
+		
+		// Small spacer
+		Control *spacer = memnew(Control);
+		spacer->set_custom_minimum_size(Size2(4, 0));
+		chip_container->add_child(spacer);
+		
+		// Remove button
+		Button *remove_button = memnew(Button);
+		remove_button->set_flat(true);
+		remove_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Close"), SNAME("EditorIcons")));
+		remove_button->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("error_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
+		remove_button->add_theme_color_override("icon_hover_color", get_theme_color(SNAME("error_color"), SNAME("Editor")));
+		remove_button->set_tooltip_text("Remove " + file.name);
+		remove_button->set_custom_minimum_size(Size2(20, 20));
+		remove_button->connect("pressed", callable_mp(this, &AIChatDock::_on_remove_attachment).bind(file.path));
+		chip_container->add_child(remove_button);
 	}
 }
 
 void AIChatDock::_clear_attachments() {
 	current_attached_files.clear();
 	_update_attached_files_display();
+}
+
+// Standard drag and drop support for file attachments and scene nodes
+bool AIChatDock::can_drop_data(const Point2 &p_point, const Variant &p_data) const {
+	Dictionary drag_data = p_data;
+	
+	// Support for drag and drop from filesystem and external sources
+	
+	// Check if this is a file/directory drag operation from FileSystem dock
+	if (drag_data.has("type") && drag_data.has("files")) {
+		String type = drag_data["type"];
+		if (type == "files" || type == "files_and_dirs") {
+			Array files = drag_data["files"];
+			// Only accept if there are files to drop (not directories)
+			return files.size() > 0;
+		}
+	}
+	
+	// Check if this is an external file drop (from OS file manager)
+	if (drag_data.has("type")) {
+		String type = drag_data["type"];
+		if (type == "files_and_dirs_external" || type == "files_external") {
+			if (drag_data.has("files")) {
+				Array files = drag_data["files"];
+				return files.size() > 0;
+			}
+		}
+	}
+	
+	// Check for direct file paths (alternative external file format)
+	if (drag_data.has("files") && !drag_data.has("type")) {
+		Array files = drag_data["files"];
+		return files.size() > 0;
+	}
+	
+	// Check if this is a scene node drag operation
+	if (drag_data.has("type") && drag_data.has("nodes")) {
+		String type = drag_data["type"];
+		if (type == "nodes") {
+			Array nodes = drag_data["nodes"];
+			return nodes.size() > 0;
+		}
+	}
+	
+	return false;
+}
+
+void AIChatDock::drop_data(const Point2 &p_point, const Variant &p_data) {
+	if (!can_drop_data(p_point, p_data)) {
+		return;
+	}
+	
+	Dictionary drag_data = p_data;
+	String type = "";
+	if (drag_data.has("type")) {
+		type = drag_data["type"];
+	}
+	
+	// Handle file drops (internal FileSystem dock files)
+	if (type == "files" || type == "files_and_dirs") {
+		Array files = drag_data["files"];
+		
+		Vector<String> file_paths;
+		for (int i = 0; i < files.size(); i++) {
+			String path = files[i];
+			// Skip directories for now (may add support later)
+			if (!path.ends_with("/")) {
+				file_paths.push_back(path);
+			}
+		}
+		
+		if (file_paths.size() > 0) {
+			_attach_dragged_files(file_paths);
+		}
+	}
+	// Handle external file drops (from OS file manager)
+	else if (type == "files_and_dirs_external" || type == "files_external" || 
+			 (drag_data.has("files") && !drag_data.has("type"))) {
+		Array files = drag_data["files"];
+		
+		Vector<String> file_paths;
+		for (int i = 0; i < files.size(); i++) {
+			String path = files[i];
+			// Skip directories for external files too
+			if (!path.ends_with("/") && !path.ends_with("\\")) {
+				file_paths.push_back(path);
+			}
+		}
+		
+		if (file_paths.size() > 0) {
+			_attach_external_files(file_paths);
+		}
+	}
+	// Handle scene node drops
+	else if (type == "nodes") {
+		Array nodes = drag_data["nodes"];
+		_attach_dragged_nodes(nodes);
+	}
+}
+
+// Forwarded drag and drop support (kept for compatibility)
+bool AIChatDock::can_drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from) const {
+	return can_drop_data(p_point, p_data);
+}
+
+void AIChatDock::drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from) {
+	drop_data(p_point, p_data);
+}
+
+void AIChatDock::_attach_dragged_files(const Vector<String> &p_files) {
+	// Use the existing attachment logic for internal project files
+	_on_files_selected(p_files);
+}
+
+void AIChatDock::_attach_external_files(const Vector<String> &p_files) {
+	for (int i = 0; i < p_files.size(); i++) {
+		String file_path = p_files[i];
+		
+		// Check if file exists
+		if (!FileAccess::exists(file_path)) {
+			print_line("AI Chat: External file does not exist: " + file_path);
+			continue;
+		}
+		
+		// Check if file is already attached
+		bool already_attached = false;
+		for (const AttachedFile &existing_file : current_attached_files) {
+			if (existing_file.path == file_path) {
+				already_attached = true;
+				break;
+			}
+		}
+		
+		if (!already_attached) {
+			AIChatDock::AttachedFile attached_file;
+			attached_file.path = file_path;
+			attached_file.name = file_path.get_file();
+			attached_file.is_image = _is_image_file(file_path);
+			attached_file.mime_type = _get_mime_type_from_extension(file_path);
+			
+			if (attached_file.is_image) {
+				// Process image (resize if needed, convert to base64)
+				if (_process_image_attachment(attached_file)) {
+					current_attached_files.push_back(attached_file);
+				} else {
+					print_line("AI Chat: Failed to process external image: " + file_path);
+				}
+			} else {
+				// Read text file content
+				Error err;
+				String content = FileAccess::get_file_as_string(file_path, &err);
+				if (err == OK) {
+					attached_file.content = content;
+					current_attached_files.push_back(attached_file);
+				} else {
+					print_line("AI Chat: Failed to read external file: " + file_path + " (Error: " + String::num_int64(err) + ")");
+				}
+			}
+		}
+	}
+	
+	_update_attached_files_display();
+}
+
+void AIChatDock::_attach_dragged_nodes(const Array &p_nodes) {
+	for (int i = 0; i < p_nodes.size(); i++) {
+		NodePath node_path = p_nodes[i];
+		
+		// Get the node to check if it exists and get info
+		Node *node = get_node_or_null(node_path);
+		if (!node) {
+			continue; // Skip invalid nodes
+		}
+		
+		// Check if node is already attached
+		bool already_attached = false;
+		for (const AttachedFile &existing_file : current_attached_files) {
+			if (existing_file.is_node && existing_file.node_path == node_path) {
+				already_attached = true;
+				break;
+			}
+		}
+		
+		if (!already_attached) {
+			AIChatDock::AttachedFile attached_node;
+			attached_node.is_node = true;
+			attached_node.node_path = node_path;
+			attached_node.name = node->get_name();
+			attached_node.node_type = node->get_class_name();
+			attached_node.path = String(node_path); // Store as string for display
+			
+			// Create descriptive content for the node
+			String node_content = "Node: " + String(node_path) + "\n";
+			node_content += "Type: " + attached_node.node_type + "\n";
+			node_content += "Name: " + attached_node.name + "\n";
+			
+			// Add additional properties if script is attached
+			Ref<Script> script = node->get_script();
+			if (script.is_valid()) {
+				node_content += "Script: " + script->get_path().get_file() + "\n";
+			}
+			
+			// Add position for Node2D/Node3D
+			Node2D *node2d = Object::cast_to<Node2D>(node);
+			if (node2d) {
+				node_content += "Position: " + String(node2d->get_position()) + "\n";
+			}
+			Node3D *node3d = Object::cast_to<Node3D>(node);
+			if (node3d) {
+				node_content += "Position: " + String(node3d->get_position()) + "\n";
+			}
+			
+			attached_node.content = node_content;
+			current_attached_files.push_back(attached_node);
+		}
+	}
+	
+	_update_attached_files_display();
+}
+
+String AIChatDock::_get_file_type_icon(const AttachedFile &p_file) {
+	// Check if this is a node attachment
+	if (p_file.is_node) {
+		// Return icon based on node type
+		if (p_file.node_type == "Node2D") {
+			return "Node2D";
+		} else if (p_file.node_type == "Node3D") {
+			return "Node3D";
+		} else if (p_file.node_type == "Control") {
+			return "Control";
+		} else if (p_file.node_type == "Label") {
+			return "Label";
+		} else if (p_file.node_type == "Button") {
+			return "Button";
+		} else {
+			return "Node";
+		}
+	}
+	
+	String extension = p_file.path.get_extension().to_lower();
+	
+	// Images
+	if (extension == "png" || extension == "jpg" || extension == "jpeg" || 
+		extension == "gif" || extension == "bmp" || extension == "svg" || 
+		extension == "webp" || extension == "tga" || extension == "exr" || extension == "hdr") {
+		return "ImageTexture";
+	}
+	
+	// Scripts
+	if (extension == "gd" || extension == "cs") {
+		return "Script";
+	}
+	
+	// Scenes
+	if (extension == "tscn" || extension == "scn") {
+		return "PackedScene";
+	}
+	
+	// Resources
+	if (extension == "tres" || extension == "res") {
+		return "Object";
+	}
+	
+	// Shaders
+	if (extension == "gdshader" || extension == "glsl") {
+		return "Shader";
+	}
+	
+	// Audio
+	if (extension == "ogg" || extension == "wav" || extension == "mp3") {
+		return "AudioStreamOggVorbis";
+	}
+	
+	// Models
+	if (extension == "gltf" || extension == "glb" || extension == "obj" || 
+		extension == "fbx" || extension == "dae") {
+		return "MeshInstance3D";
+	}
+	
+	// Text/Code files
+	if (extension == "txt" || extension == "md" || extension == "json" || 
+		extension == "xml" || extension == "yaml" || extension == "yml" ||
+		extension == "csv" || extension == "cfg" || extension == "ini") {
+		return "TextFile";
+	}
+	
+	// Default file icon
+	return "File";
 }
 
 void AIChatDock::_handle_response_chunk(const PackedByteArray &p_chunk) {
@@ -752,8 +1052,6 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 			result = EditorTools::manage_scene(args);
 		} else if (function_name == "add_collision_shape") {
 			result = EditorTools::add_collision_shape(args);
-		} else if (function_name == "generalnodeeditor") {
-			result = EditorTools::generalnodeeditor(args);
 		} else if (function_name == "list_project_files") {
 			result = EditorTools::list_project_files(args);
 		} else if (function_name == "read_file_content") {
@@ -765,6 +1063,22 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 			result = EditorTools::apply_edit(args);
 		} else if (function_name == "check_compilation_errors") {
 			result = EditorTools::check_compilation_errors(args);
+		} else if (function_name == "run_scene") {
+			result = EditorTools::run_scene(args);
+		} else if (function_name == "get_scene_tree_hierarchy") {
+			result = EditorTools::get_scene_tree_hierarchy(args);
+		} else if (function_name == "inspect_physics_body") {
+			result = EditorTools::inspect_physics_body(args);
+		} else if (function_name == "get_camera_info") {
+			result = EditorTools::get_camera_info(args);
+		} else if (function_name == "take_screenshot") {
+			result = EditorTools::take_screenshot(args);
+		} else if (function_name == "check_node_in_scene_tree") {
+			result = EditorTools::check_node_in_scene_tree(args);
+		} else if (function_name == "inspect_animation_state") {
+			result = EditorTools::inspect_animation_state(args);
+		} else if (function_name == "get_layers_and_zindex") {
+			result = EditorTools::get_layers_and_zindex(args);
 		} else if (function_name == "generate_image") {
 			// This tool should be handled by the backend, not the frontend
 			// If we receive it here, it means something went wrong in the backend filtering
@@ -997,25 +1311,36 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 		return;
 	}
 	PanelContainer *message_panel = memnew(PanelContainer);
+	
+	// Add spacing before each message for cleaner layout
+	if (chat_container->get_child_count() > 0) {
+		Control *spacer = memnew(Control);
+		spacer->set_custom_minimum_size(Size2(0, 8)); // 8px gap between messages
+		chat_container->add_child(spacer);
+	}
+	
 	chat_container->add_child(message_panel);
 
 	// Default to invisible. We'll show it only if it has content.
 	message_panel->set_visible(false);
 
-	// --- Style Configuration ---
+	// --- Modern Message Bubble Styling ---
 	Ref<StyleBoxFlat> panel_style = memnew(StyleBoxFlat);
-	panel_style->set_content_margin_all(10);
+	panel_style->set_content_margin_all(12); // Slightly more padding for modern look
+	panel_style->set_corner_radius_all(8); // Rounded corners for modern appearance
 	Color role_color;
 
 	if (p_message.role == "user") {
-		panel_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.1));
-		panel_style->set_border_width(SIDE_LEFT, 4);
-		panel_style->set_border_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+		// User messages: subtle blue background like modern chat apps
+		panel_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.08));
+		panel_style->set_border_width_all(1);
+		panel_style->set_border_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.2));
 		role_color = get_theme_color(SNAME("accent_color"), SNAME("Editor"));
 	} else { // Assistant and System
-		panel_style->set_bg_color(get_theme_color(SNAME("dark_color_3"), SNAME("Editor")));
-		panel_style->set_border_width(SIDE_LEFT, 4);
-		panel_style->set_border_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
+		// Assistant messages: clean subtle background
+		panel_style->set_bg_color(get_theme_color(SNAME("dark_color_2"), SNAME("Editor")));
+		panel_style->set_border_width_all(1);
+		panel_style->set_border_color(get_theme_color(SNAME("dark_color_3"), SNAME("Editor")));
 		role_color = (p_message.role == "system") ? get_theme_color(SNAME("warning_color"), SNAME("Editor")) : get_theme_color(SNAME("font_color"), SNAME("Editor"));
 	}
 	message_panel->add_theme_style_override("panel", panel_style);
@@ -1070,16 +1395,18 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 		
 		for (const AttachedFile &file : p_message.attached_files) {
 			if (file.is_image) {
-				// Create image display
+				// Create image display with improved styling
 				PanelContainer *image_panel = memnew(PanelContainer);
 				files_flow->add_child(image_panel);
 				
 				Ref<StyleBoxFlat> image_style = memnew(StyleBoxFlat);
 				image_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
-				image_style->set_border_width_all(1);
+				image_style->set_border_width_all(2);
 				image_style->set_border_color(get_theme_color(SNAME("success_color"), SNAME("Editor")));
-				image_style->set_corner_radius_all(8);
-				image_style->set_content_margin_all(8);
+				image_style->set_corner_radius_all(12);
+				image_style->set_content_margin_all(6);
+				image_style->set_shadow_color(Color(0, 0, 0, 0.2));
+				image_style->set_shadow_size(4);
 				image_panel->add_theme_style_override("panel", image_style);
 				
 				VBoxContainer *image_container = memnew(VBoxContainer);
@@ -1097,8 +1424,8 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 						}
 						
 						if (!display_image->is_empty()) {
-							// Create display sized image (max 256px for chat)
-							Vector2i display_size = _calculate_downsampled_size(file.display_size, 256);
+							// Create display sized image (max 150px for chat)
+							Vector2i display_size = _calculate_downsampled_size(file.display_size, 150);
 							display_image->resize(display_size.x, display_size.y, Image::INTERPOLATE_LANCZOS);
 							
 							Ref<ImageTexture> display_texture = ImageTexture::create_from_image(display_image);
@@ -1141,6 +1468,23 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 				size_info->add_theme_font_size_override("font_size", 10);
 				size_info->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 				info_vbox->add_child(size_info);
+				
+				// Add spacer to push save button to the right
+				Control *spacer = memnew(Control);
+				spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+				image_info->add_child(spacer);
+				
+				// Save button for attached images
+				Button *save_button = memnew(Button);
+				save_button->set_text("Save");
+				save_button->set_flat(true);
+				save_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Save"), SNAME("EditorIcons")));
+				save_button->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+				save_button->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+				save_button->set_tooltip_text("Save this image to your project");
+				String image_format = (file.mime_type == "image/jpeg" || file.mime_type == "image/jpg") ? "jpg" : "png";
+				save_button->connect("pressed", callable_mp(this, &AIChatDock::_on_save_image_pressed).bind(file.base64_data, image_format));
+				image_info->add_child(save_button);
 			} else {
 				// Text file display
 				HBoxContainer *file_row = memnew(HBoxContainer);
@@ -2189,16 +2533,23 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	HBoxContainer *info_container = memnew(HBoxContainer);
 	image_container->add_child(info_container);
 	
+	HBoxContainer *prompt_container = memnew(HBoxContainer);
+	info_container->add_child(prompt_container);
+	
+	Label *prompt_icon = memnew(Label);
+	prompt_icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
+	prompt_container->add_child(prompt_icon);
+	
 	Label *prompt_label = memnew(Label);
 	String prompt = p_data.get("prompt", "Generated Image");
-	prompt_label->set_text("📝 " + prompt);
+	prompt_label->set_text(prompt);
 	prompt_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
 	prompt_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-	info_container->add_child(prompt_label);
+	prompt_container->add_child(prompt_label);
 	
-	// Resize image for display (max 400px in tool results to keep them compact)
+	// Resize image for display (max 200px in tool results to keep them compact)
 	Vector2i original_size = Vector2i(generated_image->get_width(), generated_image->get_height());
-	Vector2i display_size = _calculate_downsampled_size(original_size, 400);
+	Vector2i display_size = _calculate_downsampled_size(original_size, 200);
 	
 	if (display_size != original_size) {
 		generated_image->resize(display_size.x, display_size.y, Image::INTERPOLATE_LANCZOS);
@@ -2214,7 +2565,7 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	image_display->set_custom_minimum_size(Size2(display_size.x, display_size.y));
 	image_container->add_child(image_display);
 	
-	// Add technical details
+	// Add technical details and save button
 	HBoxContainer *tech_container = memnew(HBoxContainer);
 	image_container->add_child(tech_container);
 	
@@ -2230,4 +2581,66 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	model_label->add_theme_font_size_override("font_size", 10);
 	model_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 	tech_container->add_child(model_label);
-} 
+	
+	// Add spacer to push save button to the right
+	Control *spacer = memnew(Control);
+	spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	tech_container->add_child(spacer);
+	
+	// Save button
+	Button *save_button = memnew(Button);
+	save_button->set_text("Save to...");
+	save_button->set_flat(true);
+	save_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Save"), SNAME("EditorIcons")));
+	save_button->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+	save_button->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+	save_button->set_tooltip_text("Save this image to your project");
+	save_button->connect("pressed", callable_mp(this, &AIChatDock::_on_save_image_pressed).bind(p_base64_data, "png"));
+	tech_container->add_child(save_button);
+}
+
+void AIChatDock::_on_save_image_pressed(const String &p_base64_data, const String &p_format) {
+	if (p_base64_data.is_empty()) {
+		return;
+	}
+	
+	// Store the image data for saving
+	pending_save_image_data = p_base64_data;
+	pending_save_image_format = p_format;
+	
+	// Set up the save dialog
+	save_image_dialog->set_current_file("generated_image." + p_format);
+	save_image_dialog->popup_centered(Size2(800, 600));
+}
+
+void AIChatDock::_on_save_image_location_selected(const Vector<String> &p_files) {
+	if (p_files.size() == 0 || pending_save_image_data.is_empty()) {
+		return;
+	}
+	
+	String save_path = p_files[0];
+	
+	// Decode base64 to image data
+	Vector<uint8_t> image_data = CoreBind::Marshalls::get_singleton()->base64_to_raw(pending_save_image_data);
+	if (image_data.size() == 0) {
+		print_line("AI Chat: Failed to decode image data for saving");
+		return;
+	}
+	
+	// Save the image file
+	Ref<FileAccess> file = FileAccess::open(save_path, FileAccess::WRITE);
+	if (file.is_null()) {
+		print_line("AI Chat: Failed to open file for writing: " + save_path);
+		return;
+	}
+	
+	file->store_buffer(image_data);
+	file->close();
+	
+	print_line("AI Chat: Image saved successfully to: " + save_path);
+	
+	// Clear pending data
+	pending_save_image_data = "";
+	pending_save_image_format = "";
+}
+

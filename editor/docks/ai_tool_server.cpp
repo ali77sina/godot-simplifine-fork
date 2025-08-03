@@ -70,6 +70,40 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 		result = EditorTools::read_file_content(args);
 	} else if (function_name == "read_file_advanced") {
 		result = EditorTools::read_file_advanced(args);
+	} else if (function_name == "get_scene_info") {
+		result = EditorTools::get_scene_info(args);
+	} else if (function_name == "get_all_nodes") {
+		result = EditorTools::get_all_nodes(args);
+	} else if (function_name == "search_nodes_by_type") {
+		result = EditorTools::search_nodes_by_type(args);
+	} else if (function_name == "get_editor_selection") {
+		result = EditorTools::get_editor_selection(args);
+	} else if (function_name == "get_node_properties") {
+		result = EditorTools::get_node_properties(args);
+	} else if (function_name == "save_scene") {
+		result = EditorTools::save_scene(args);
+	} else if (function_name == "create_node") {
+		result = EditorTools::create_node(args);
+	} else if (function_name == "delete_node") {
+		result = EditorTools::delete_node(args);
+	} else if (function_name == "set_node_property") {
+		result = EditorTools::set_node_property(args);
+	} else if (function_name == "move_node") {
+		result = EditorTools::move_node(args);
+	} else if (function_name == "call_node_method") {
+		result = EditorTools::call_node_method(args);
+	} else if (function_name == "get_available_classes") {
+		result = EditorTools::get_available_classes(args);
+	} else if (function_name == "get_node_script") {
+		result = EditorTools::get_node_script(args);
+	} else if (function_name == "attach_script") {
+		result = EditorTools::attach_script(args);
+	} else if (function_name == "manage_scene") {
+		result = EditorTools::manage_scene(args);
+	} else if (function_name == "add_collision_shape") {
+		result = EditorTools::add_collision_shape(args);
+	} else if (function_name == "check_compilation_errors") {
+		result = EditorTools::check_compilation_errors(args);
 	} else if (function_name == "test_diff_and_errors") {
 		// Test endpoint that simulates an edit to test diff and compilation error functionality
 		String path = args.get("path", "");
@@ -110,8 +144,22 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 				result["has_errors"] = compilation_errors.size() > 0;
 			}
 		}
-	} else if (function_name == "check_compilation_errors") {
-		result = EditorTools::check_compilation_errors(args);
+	} else if (function_name == "run_scene") {
+		result = EditorTools::run_scene(args);
+	} else if (function_name == "get_scene_tree_hierarchy") {
+		result = EditorTools::get_scene_tree_hierarchy(args);
+	} else if (function_name == "inspect_physics_body") {
+		result = EditorTools::inspect_physics_body(args);
+	} else if (function_name == "get_camera_info") {
+		result = EditorTools::get_camera_info(args);
+	} else if (function_name == "take_screenshot") {
+		result = EditorTools::take_screenshot(args);
+	} else if (function_name == "check_node_in_scene_tree") {
+		result = EditorTools::check_node_in_scene_tree(args);
+	} else if (function_name == "inspect_animation_state") {
+		result = EditorTools::inspect_animation_state(args);
+	} else if (function_name == "get_layers_and_zindex") {
+		result = EditorTools::get_layers_and_zindex(args);
 	} else {
 		result["error"] = "Unknown function: " + function_name;
 	}

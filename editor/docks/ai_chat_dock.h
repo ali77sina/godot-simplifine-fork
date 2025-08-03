@@ -97,6 +97,10 @@ private:
 		Vector2i original_size = Vector2i(0, 0);
 		Vector2i display_size = Vector2i(0, 0);
 		bool was_downsampled = false;
+		// Node support
+		bool is_node = false;
+		NodePath node_path;
+		String node_type;
 	};
 
 	struct ChatMessage {
@@ -132,7 +136,12 @@ private:
 	Button *attach_button = nullptr;
 	HFlowContainer *attached_files_container = nullptr;
 	EditorFileDialog *file_dialog = nullptr;
+	EditorFileDialog *save_image_dialog = nullptr;
 	AcceptDialog *image_warning_dialog = nullptr;
+	
+	// For saving images
+	String pending_save_image_data; // Base64 image data to save
+	String pending_save_image_format; // "png" or "jpg"
 
 	Ref<HTTPClient> http_client;
 	RequestStatus http_status = STATUS_IDLE;
@@ -162,6 +171,8 @@ private:
 	void _on_remove_attachment(const String &p_path);
 	void _on_conversation_selected(int p_index);
 	void _on_new_conversation_pressed();
+	void _on_save_image_pressed(const String &p_base64_data, const String &p_format);
+	void _on_save_image_location_selected(const Vector<String> &p_files);
 	void _handle_response_chunk(const PackedByteArray &p_chunk);
 	void _process_ndjson_line(const String &p_line);
 	void _execute_tool_calls(const Array &p_tool_calls);
@@ -210,6 +221,16 @@ private:
 	void _handle_generated_image(const String &p_base64_data, const String &p_id);
 	void _display_generated_image_deferred(const String &p_base64_data, const String &p_id);
 	void _display_generated_image_in_tool_result(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_data);
+	
+	// Drag and drop support
+	bool can_drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from) const;
+	void drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from);
+	bool can_drop_data(const Point2 &p_point, const Variant &p_data) const override;
+	void drop_data(const Point2 &p_point, const Variant &p_data) override;
+	void _attach_dragged_files(const Vector<String> &p_files);
+	void _attach_external_files(const Vector<String> &p_files);
+	void _attach_dragged_nodes(const Array &p_nodes);
+	String _get_file_type_icon(const AttachedFile &p_file);
 
 protected:
 	void _notification(int p_notification);

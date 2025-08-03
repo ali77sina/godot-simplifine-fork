@@ -535,6 +535,146 @@ godot_tools = [
                 "required": ["prompt"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_scene",
+            "description": "Run/play the current scene or a specific scene to observe behavior",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scene_path": {
+                        "type": "string",
+                        "description": "Path to scene file to run (optional, uses current scene if not specified)"
+                    },
+                    "duration": {
+                        "type": "integer",
+                        "description": "How long to run the scene in seconds (default: 5)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_scene_tree_hierarchy",
+            "description": "Get complete scene tree hierarchy with parent-child relationships",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_properties": {
+                        "type": "boolean",
+                        "description": "Include basic properties for each node (default: false)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_physics_body",
+            "description": "Inspect physics properties of a RigidBody2D, CharacterBody2D, or other physics body",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the physics body node"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_camera_info",
+            "description": "Get camera and viewport information for debugging visual issues",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "camera_path": {
+                        "type": "string",
+                        "description": "Path to specific camera (optional, finds main camera if not specified)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_screenshot",
+            "description": "Take a screenshot of the current game view for visual debugging",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "Filename for the screenshot (optional)"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_node_in_scene_tree",
+            "description": "Verify if a node is properly added to the scene tree and active",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the node to check"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect_animation_state",
+            "description": "Check animation player state and current animations",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to AnimationPlayer or AnimatedSprite2D node"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_layers_and_zindex",
+            "description": "Get layer and z-index information for visual debugging",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the node (optional, gets all if not specified)"
+                    }
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -605,8 +745,6 @@ def chat():
 
                 # Handle image generation (backend-only tool)
                 image_generations = []
-                items_to_delete = []  # Collect items to delete after iteration
-                
                 if tool_call_aggregator:
                     for i, func in tool_call_aggregator.items():
                         if func["name"] == "generate_image":
@@ -618,12 +756,10 @@ def chat():
                             image_result = generate_image_internal(arguments)
                             if image_result.get("success"):
                                 image_generations.append(image_result)
-                                items_to_delete.append(i)  # Mark for deletion
-                
-                # Now safely delete the items after iteration
-                for i in items_to_delete:
-                    del tool_call_aggregator[i]
-                    del tool_ids[i]
+                                
+                                # Remove generate_image from tool calls so it doesn't get sent to frontend
+                                del tool_call_aggregator[i]
+                                del tool_ids[i]
 
                 # Case 1: Only image generations (no other function calls)
                 if image_generations and not tool_call_aggregator:
