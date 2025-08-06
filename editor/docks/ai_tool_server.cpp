@@ -160,6 +160,8 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 		result = EditorTools::inspect_animation_state(args);
 	} else if (function_name == "get_layers_and_zindex") {
 		result = EditorTools::get_layers_and_zindex(args);
+	} else if (function_name == "search_across_project") {
+		result = EditorTools::search_across_project(args);
 	} else {
 		result["error"] = "Unknown function: " + function_name;
 	}

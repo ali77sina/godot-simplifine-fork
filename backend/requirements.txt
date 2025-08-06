@@ -3,4 +3,16 @@
 flask
 python-dotenv
 openai>=1.50.0  # Required for responses API and image generation
-requests  # For HTTP requests 
+requests  # For HTTP requests
+google-cloud-storage  # For GCP Cloud Storage
+google-cloud-aiplatform
+vertexai  # For GCP multimodal embeddings
+networkx  # For graph structure analysis
+google-auth  # For OAuth authentication
+google-auth-oauthlib  # For OAuth flow
+google-auth-httplib2  # For OAuth http requests
+pillow  # For image processing
+numpy  # For embedding operations
+faiss-cpu  # For fast similarity search
+flask-session  # For session management
+authlib  # For OAuth handling 

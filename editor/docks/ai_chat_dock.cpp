@@ -39,6 +39,7 @@
 #include "core/string/ustring.h"
 #include "core/io/marshalls.h"
 #include "core/core_bind.h"
+#include "core/config/project_settings.h"
 #include "scene/resources/image_texture.h"
 #include "editor/editor_node.h"
 #include "editor/editor_interface.h"
@@ -163,6 +164,9 @@ void AIChatDock::_notification(int p_notification) {
 			model_dropdown->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 			model_dropdown->connect("item_selected", callable_mp(this, &AIChatDock::_on_model_selected));
 			top_container->add_child(model_dropdown);
+			
+			// Setup authentication UI
+			_setup_authentication_ui();
 
 			// Container for attached files (initially hidden) - will be added to bottom panel later
 			attached_files_container = memnew(HFlowContainer);
@@ -477,6 +481,10 @@ void AIChatDock::_notification(int p_notification) {
 				api_key = EditorSettings::get_singleton()->get_setting("ai_chat/api_key");
 			}
 		} break;
+		case NOTIFICATION_READY: {
+			// Auto-verify saved authentication when everything is fully ready
+			_auto_verify_saved_credentials();
+		} break;
 		case NOTIFICATION_THEME_CHANGED: {
 			// Theme updates handled automatically
 		} break;
@@ -487,6 +495,11 @@ void AIChatDock::_on_send_button_pressed() {
 	String message = input_field->get_text().strip_edges();
 	if (message.is_empty() || is_waiting_for_response) {
 		return;
+	}
+
+	// Auto-suggest relevant files based on message content
+	if (embedding_system_initialized && initial_indexing_done) {
+		_auto_attach_relevant_context();
 	}
 
 	// PERFORMANCE OPTIMIZATION: Instant UI feedback with deferred heavy processing
@@ -782,6 +795,590 @@ void AIChatDock::_on_edit_message_cancel_pressed(int p_message_index) {
 	_rebuild_conversation_ui(chat_history);
 	
 	call_deferred("_scroll_to_bottom");
+}
+
+// Embedding System Implementation
+
+void AIChatDock::_initialize_embedding_system() {
+	if (embedding_system_initialized) {
+		return;
+	}
+	
+	// Require user authentication for embedding system
+	if (!_is_user_authenticated()) {
+		print_line("AI Chat: Cannot initialize embedding system - user not authenticated");
+		return;
+	}
+	
+	print_line("AI Chat: Initializing embedding system for user: " + current_user_name);
+	
+	// Reset indexing flag to ensure fresh indexing for this user/session
+	initial_indexing_done = false;
+	
+	// Create HTTP request for embedding API calls
+	if (!embedding_request) {
+		embedding_request = memnew(HTTPRequest);
+		add_child(embedding_request);
+		embedding_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_embedding_request_completed));
+	}
+	
+	// Connect to file system signals
+	EditorFileSystem *filesystem = EditorFileSystem::get_singleton();
+	if (filesystem) {
+		if (!filesystem->is_connected("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed))) {
+			filesystem->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
+		}
+		if (!filesystem->is_connected("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed))) {
+			filesystem->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
+		}
+	}
+	
+	embedding_system_initialized = true;
+	
+	// Start initial project indexing (always happens since we reset the flag above)
+	call_deferred("_perform_initial_indexing");
+}
+
+void AIChatDock::_perform_initial_indexing() {
+	print_line("AI Chat: 🔄 Starting comprehensive project indexing for enhanced AI assistance...");
+	print_line("AI Chat: This may take a moment depending on project size");
+	
+	Dictionary data;
+	data["action"] = "index_project";
+	data["project_root"] = _get_project_root_path();
+	data["force_reindex"] = true;  // Force complete reindex on login for fresh start
+	
+	_send_embedding_request("index_project", data);
+}
+
+void AIChatDock::_on_filesystem_changed() {
+	if (!embedding_system_initialized) {
+		return;
+	}
+	
+	print_line("AI Chat: Filesystem changed, updating embeddings");
+	
+	// Get project summary to see what changed
+	Dictionary data;
+	data["action"] = "status";
+	data["project_root"] = _get_project_root_path();
+	
+	_send_embedding_request("status", data);
+}
+
+void AIChatDock::_on_sources_changed(bool p_exist) {
+	if (!embedding_system_initialized || !p_exist) {
+		return;
+	}
+	
+	print_line("AI Chat: Sources changed, performing incremental update");
+	
+	// For now, do a light reindex
+	Dictionary data;
+	data["action"] = "index_project";
+	data["project_root"] = _get_project_root_path();
+	data["force_reindex"] = false;
+	
+	_send_embedding_request("index_project", data);
+}
+
+void AIChatDock::_update_file_embedding(const String &p_file_path) {
+	if (!embedding_system_initialized || !_should_index_file(p_file_path)) {
+		return;
+	}
+	
+	print_line("AI Chat: Updating embedding for file: " + p_file_path);
+	
+	Dictionary data;
+	data["action"] = "update_file";
+	data["project_root"] = _get_project_root_path();
+	data["file_path"] = p_file_path;
+	
+	_send_embedding_request("update_file", data);
+}
+
+void AIChatDock::_remove_file_embedding(const String &p_file_path) {
+	if (!embedding_system_initialized) {
+		return;
+	}
+	
+	print_line("AI Chat: Removing embedding for file: " + p_file_path);
+	
+	Dictionary data;
+	data["action"] = "remove_file";
+	data["project_root"] = _get_project_root_path();
+	data["file_path"] = p_file_path;
+	
+	_send_embedding_request("remove_file", data);
+}
+
+void AIChatDock::_send_embedding_request(const String &p_action, const Dictionary &p_data) {
+	if (!embedding_request) {
+		print_line("AI Chat: Embedding request not initialized");
+		return;
+	}
+	
+	if (!_is_user_authenticated()) {
+		print_line("AI Chat: Cannot send embedding request - user not authenticated");
+		return;
+	}
+	
+	// Prepare request with user authentication
+	String base_url = api_endpoint.replace("/chat", "/embed");
+	
+	// Add user authentication to request data
+	Dictionary auth_data = p_data.duplicate();
+	auth_data["user_id"] = current_user_id;
+	auth_data["machine_id"] = OS::get_singleton()->get_unique_id();
+	
+	String json_data = JSON::stringify(auth_data);
+	
+	PackedStringArray headers;
+	headers.push_back("Content-Type: application/json");
+	if (!auth_token.is_empty()) {
+		headers.push_back("Authorization: Bearer " + auth_token);
+	}
+	if (!api_key.is_empty()) {
+		headers.push_back("X-API-Key: " + api_key);
+	}
+	
+	Error err = embedding_request->request(base_url, headers, HTTPClient::METHOD_POST, json_data);
+	if (err != OK) {
+		print_line("AI Chat: Failed to send embedding request: " + String::num_int64(err));
+	}
+}
+
+void AIChatDock::_on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
+	String response_text = String::utf8((const char *)p_body.ptr(), p_body.size());
+	
+	if (p_code != 200) {
+		print_line("AI Chat: Embedding request failed with code " + String::num_int64(p_code) + ": " + response_text);
+		return;
+	}
+	
+	JSON json;
+	Error parse_err = json.parse(response_text);
+	if (parse_err != OK) {
+		print_line("AI Chat: Failed to parse embedding response: " + response_text);
+		return;
+	}
+	
+	Dictionary response = json.get_data();
+	bool success = response.get("success", false);
+	String action = response.get("action", "");
+	
+	if (!success) {
+		print_line("AI Chat: Embedding operation failed: " + String(response.get("error", "Unknown error")));
+		return;
+	}
+	
+	print_line("AI Chat: Embedding operation '" + action + "' completed successfully");
+	
+	if (action == "index_project") {
+		Dictionary stats = response.get("stats", Dictionary());
+		int indexed = stats.get("indexed", 0);
+		int skipped = stats.get("skipped", 0);
+		int errors = stats.get("errors", 0);
+		
+		print_line("AI Chat: Project indexing completed - Indexed: " + String::num_int64(indexed) + 
+				   ", Skipped: " + String::num_int64(skipped) + 
+				   (errors > 0 ? ", Errors: " + String::num_int64(errors) : ""));
+		
+		if (!initial_indexing_done) {
+			initial_indexing_done = true;
+			print_line("AI Chat: ✅ Project is now fully indexed and ready for AI assistance!");
+		} else {
+			print_line("AI Chat: ✅ Project index updated successfully");
+		}
+	} else if (action == "search") {
+		// Handle multimodal search results for relevant file suggestions
+		Array results = response.get("results", Array());
+		if (results.size() > 0) {
+			print_line("AI Chat: Found " + String::num_int64(results.size()) + " relevant files");
+			
+			// Auto-attach highly relevant files (similarity > 0.7)
+			for (int i = 0; i < results.size(); i++) {
+				Dictionary result = results[i];
+				String file_path = result.get("file_path", "");
+				float similarity = result.get("similarity", 0.0f);
+				String modality = result.get("modality", "text");
+				
+				if (similarity > 0.7 && !file_path.is_empty()) {
+					// Check if file is not already attached
+					bool already_attached = false;
+					for (const AttachedFile &existing_file : current_attached_files) {
+						if (existing_file.path == file_path) {
+							already_attached = true;
+							break;
+						}
+					}
+					
+					if (!already_attached) {
+						print_line("AI Chat: Auto-attaching relevant " + modality + " file: " + file_path + " (similarity: " + String::num(similarity) + ")");
+						Vector<String> files_to_attach;
+						files_to_attach.push_back(file_path);
+						_on_files_selected(files_to_attach);
+					}
+				}
+			}
+		}
+	} else if (action == "status") {
+		// Handle status response from filesystem changes
+		Dictionary stats = response.get("stats", Dictionary());
+		int total_files = stats.get("total_files", 0);
+		int indexed_files = stats.get("indexed_files", 0);
+		
+		print_line("AI Chat: Status check - " + String::num_int64(indexed_files) + "/" + String::num_int64(total_files) + " files indexed");
+		
+		// Check if we need to re-index (files may have changed)
+		// For now, always do an incremental re-index on filesystem changes
+		Dictionary reindex_data;
+		reindex_data["action"] = "index_project";
+		reindex_data["project_root"] = _get_project_root_path();
+		reindex_data["force_reindex"] = false; // Incremental update
+		
+		print_line("AI Chat: Triggering incremental re-index due to filesystem changes");
+		_send_embedding_request("index_project", reindex_data);
+	}
+}
+
+bool AIChatDock::_should_index_file(const String &p_file_path) {
+	// Check file extension for multimodal support
+	String ext = p_file_path.get_extension().to_lower();
+	static const HashSet<String> indexable_extensions = {
+		// Text files
+		"gd", "cs", "js",                    // Scripts
+		"tscn", "scn",                      // Scenes
+		"tres", "res",                      // Resources
+		"json", "cfg",                      // Config files
+		"md", "txt",                        // Documentation
+		"glsl", "shader",                   // Shaders
+		
+		// Image files
+		"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tga", "exr",
+		
+		// Audio files
+		"wav", "ogg", "mp3", "aac", "flac",
+		
+		// 3D models
+		"obj", "fbx", "gltf", "glb"
+	};
+	
+	if (!indexable_extensions.has(ext)) {
+		return false;
+	}
+	
+	// Skip hidden files and temp directories
+	if (p_file_path.find("/.") != -1 || 
+		p_file_path.find("/.godot/") != -1 || 
+		p_file_path.find("/build/") != -1 || 
+		p_file_path.find("/temp/") != -1) {
+		return false;
+	}
+	
+	return true;
+}
+
+String AIChatDock::_get_project_root_path() {
+	return ProjectSettings::get_singleton()->get_resource_path();
+}
+
+void AIChatDock::_suggest_relevant_files(const String &p_query) {
+	if (!embedding_system_initialized || p_query.is_empty()) {
+		return;
+	}
+	
+	print_line("AI Chat: Searching for files relevant to: " + p_query);
+	
+	Dictionary data;
+	data["action"] = "search";
+	data["project_root"] = _get_project_root_path();
+	data["query"] = p_query;
+	data["k"] = 5; // Get top 5 results
+	
+	_send_embedding_request("search", data);
+}
+
+void AIChatDock::_auto_attach_relevant_context() {
+	// Get the current message text
+	String message_text = input_field->get_text().strip_edges();
+	if (message_text.is_empty()) {
+		return;
+	}
+	
+	// Auto-suggest relevant files if the message is substantial
+	if (message_text.length() > 20) {
+		_suggest_relevant_files(message_text);
+	}
+}
+
+// Authentication Implementation
+
+void AIChatDock::_setup_authentication_ui() {
+	// User authentication row
+	HBoxContainer *auth_container = memnew(HBoxContainer);
+	add_child(auth_container);
+	
+	Label *auth_label = memnew(Label);
+	auth_label->set_text("User:");
+	auth_container->add_child(auth_label);
+	
+	user_status_label = memnew(Label);
+	user_status_label->set_text("Not logged in");
+	user_status_label->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	auth_container->add_child(user_status_label);
+	
+	login_button = memnew(Button);
+	login_button->set_text("Login");
+	login_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Key"), SNAME("EditorIcons")));
+	login_button->connect("pressed", callable_mp(this, &AIChatDock::_on_login_button_pressed));
+	auth_container->add_child(login_button);
+	
+	// Create HTTP request for authentication
+	auth_request = memnew(HTTPRequest);
+	add_child(auth_request);
+	auth_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_auth_request_completed));
+}
+
+void AIChatDock::_on_login_button_pressed() {
+	if (_is_user_authenticated()) {
+		// User is logged in, offer logout
+		_logout_user();
+		return;
+	}
+	
+	// Open authentication in system browser
+	String auth_url = api_endpoint.replace("/chat", "/auth/login");
+	auth_url += "?machine_id=" + OS::get_singleton()->get_unique_id() + "&provider=google";
+	OS::get_singleton()->shell_open(auth_url);
+	
+	// Show simple notification (no manual action needed)
+	AcceptDialog *auth_dialog = memnew(AcceptDialog);
+	auth_dialog->set_text("🔐 Authentication opened in your browser.\n\nComplete the login and this will automatically detect when you're logged in!");
+	auth_dialog->set_title("AI Chat - Login");
+	auth_dialog->get_ok_button()->set_text("Got it!");
+	
+	get_viewport()->add_child(auth_dialog);
+	auth_dialog->popup_centered();
+	auth_dialog->connect("confirmed", callable_mp((Node *)auth_dialog, &Node::queue_free));
+	
+	// Start automatic polling for login completion
+	user_status_label->set_text("Waiting for login...");
+	_start_login_polling();
+}
+
+void AIChatDock::_on_auth_dialog_action(const StringName &p_action) {
+	// This method is kept for compatibility but no longer used
+	// Login polling handles authentication automatically
+}
+
+void AIChatDock::_check_authentication_status() {
+	// Check with backend if user is authenticated
+	String auth_check_url = api_endpoint.replace("/chat", "/auth/status");
+	
+	PackedStringArray headers;
+	headers.push_back("Content-Type: application/json");
+	
+	Dictionary data;
+	data["machine_id"] = OS::get_singleton()->get_unique_id();
+	String json_data = JSON::stringify(data);
+	
+	Error err = auth_request->request(auth_check_url, headers, HTTPClient::METHOD_POST, json_data);
+	if (err != OK) {
+		print_line("AI Chat: Failed to check authentication status: " + String::num_int64(err));
+	}
+}
+
+void AIChatDock::_on_auth_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
+	String response_text = String::utf8((const char *)p_body.ptr(), p_body.size());
+	
+	print_line("AI Chat: 📡 Auth request completed - Result: " + String::num_int64(p_result) + ", Code: " + String::num_int64(p_code));
+	
+	if (p_code != 200) {
+		print_line("AI Chat: ❌ Authentication request failed with code " + String::num_int64(p_code) + ": " + response_text);
+		// If it's a connection error, the backend might not be running
+		if (p_code == 0) {
+			print_line("AI Chat: 🔌 Backend server might not be running. Please start the backend server.");
+		}
+		return;
+	}
+	
+	JSON json;
+	Error parse_err = json.parse(response_text);
+	if (parse_err != OK) {
+		print_line("AI Chat: Failed to parse authentication response: " + response_text);
+		return;
+	}
+	
+	Dictionary response = json.get_data();
+	bool success = response.get("success", false);
+	
+	if (success && response.has("user")) {
+		Dictionary user_data = response.get("user", Dictionary());
+		current_user_id = user_data.get("id", "");
+		current_user_name = user_data.get("name", "");
+		auth_token = response.get("token", "");
+		
+		// Save authentication
+		EditorSettings::get_singleton()->set_setting("ai_chat/auth_token", auth_token);
+		EditorSettings::get_singleton()->set_setting("ai_chat/user_id", current_user_id);
+		EditorSettings::get_singleton()->set_setting("ai_chat/user_name", current_user_name);
+		
+		print_line("AI Chat: ✅ User authenticated successfully: " + current_user_name);
+		
+		// Stop login polling if it was running
+		_stop_login_polling();
+		
+		// Force UI update
+		_update_user_status();
+		
+		// Force comprehensive project indexing
+		_ensure_project_indexing();
+	} else {
+		// Authentication failed - clear any invalid saved credentials
+		current_user_id = "";
+		current_user_name = "";
+		auth_token = "";
+		
+		// Remove invalid credentials from settings
+		if (EditorSettings::get_singleton()->has_setting("ai_chat/auth_token")) {
+			EditorSettings::get_singleton()->erase("ai_chat/auth_token");
+			EditorSettings::get_singleton()->erase("ai_chat/user_id");
+			EditorSettings::get_singleton()->erase("ai_chat/user_name");
+			print_line("AI Chat: Cleared invalid saved credentials");
+		}
+		
+		_update_user_status();
+		print_line("AI Chat: Authentication failed: " + String(response.get("error", "Unknown error")));
+	}
+}
+
+void AIChatDock::_update_user_status() {
+	if (_is_user_authenticated()) {
+		user_status_label->set_text(current_user_name);
+		login_button->set_text("Logout");
+		login_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Unlock"), SNAME("EditorIcons")));
+	} else {
+		user_status_label->set_text("Not logged in");
+		login_button->set_text("Login");
+		login_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Key"), SNAME("EditorIcons")));
+	}
+}
+
+void AIChatDock::_logout_user() {
+	// Clear authentication data
+	current_user_id = "";
+	current_user_name = "";
+	auth_token = "";
+	
+	// Reset embedding system state
+	embedding_system_initialized = false;
+	initial_indexing_done = false;
+	
+	// Remove from settings
+	EditorSettings::get_singleton()->erase("ai_chat/auth_token");
+	EditorSettings::get_singleton()->erase("ai_chat/user_id");
+	EditorSettings::get_singleton()->erase("ai_chat/user_name");
+	
+	_update_user_status();
+	print_line("AI Chat: User logged out - embedding system reset");
+}
+
+bool AIChatDock::_is_user_authenticated() const {
+	return !current_user_id.is_empty() && !auth_token.is_empty();
+}
+
+void AIChatDock::_auto_verify_saved_credentials() {
+	print_line("AI Chat: 🔍 Checking for saved authentication credentials...");
+	
+	// Check if we have saved authentication credentials
+	if (EditorSettings::get_singleton()->has_setting("ai_chat/auth_token")) {
+		String saved_token = EditorSettings::get_singleton()->get_setting("ai_chat/auth_token");
+		String saved_user_id = EditorSettings::get_singleton()->get_setting("ai_chat/user_id");
+		String saved_user_name = EditorSettings::get_singleton()->get_setting("ai_chat/user_name");
+		
+		if (!saved_token.is_empty() && !saved_user_id.is_empty()) {
+			// Set credentials for verification
+			auth_token = saved_token;
+			current_user_id = saved_user_id;
+			current_user_name = saved_user_name;
+			
+			print_line("AI Chat: 🔐 Auto-verifying saved authentication for user: " + saved_user_name);
+			
+			// Show temporary status while verifying
+			user_status_label->set_text("Verifying login...");
+			
+			// Verify with backend
+			_check_authentication_status();
+		} else {
+			print_line("AI Chat: ❌ Saved credentials found but incomplete");
+		}
+	} else {
+		print_line("AI Chat: ℹ️ No saved authentication credentials found");
+	}
+}
+
+void AIChatDock::_start_login_polling() {
+	login_poll_attempts = 0;
+	login_poll_max_attempts = 30; // Poll for 30 seconds (every 1 second)
+	
+	// Create timer if it doesn't exist
+	if (!login_poll_timer) {
+		login_poll_timer = memnew(Timer);
+		add_child(login_poll_timer);
+		login_poll_timer->connect("timeout", callable_mp(this, &AIChatDock::_poll_login_status));
+	}
+	
+	// Start polling every 1 second
+	login_poll_timer->set_wait_time(1.0);
+	login_poll_timer->set_one_shot(false);
+	login_poll_timer->start();
+	
+	print_line("AI Chat: 🔄 Started automatic login polling");
+}
+
+void AIChatDock::_poll_login_status() {
+	login_poll_attempts++;
+	
+	if (login_poll_attempts > login_poll_max_attempts) {
+		// Stop polling after max attempts
+		login_poll_timer->stop();
+		user_status_label->set_text("Login timeout - try again");
+		print_line("AI Chat: ⏰ Login polling timed out");
+		return;
+	}
+	
+	// Check authentication status
+	_check_authentication_status();
+}
+
+void AIChatDock::_stop_login_polling() {
+	if (login_poll_timer && login_poll_timer->is_connected("timeout", callable_mp(this, &AIChatDock::_poll_login_status))) {
+		login_poll_timer->stop();
+		print_line("AI Chat: ✅ Stopped login polling");
+	}
+}
+
+void AIChatDock::_ensure_project_indexing() {
+	print_line("AI Chat: 🔄 Ensuring project indexing starts...");
+	
+	// Make sure user is authenticated
+	if (!_is_user_authenticated()) {
+		print_line("AI Chat: ❌ Cannot start indexing - user not authenticated");
+		return;
+	}
+	
+	// Initialize embedding system if needed
+	if (!embedding_system_initialized) {
+		print_line("AI Chat: 📝 Initializing embedding system...");
+		_initialize_embedding_system();
+	} else {
+		print_line("AI Chat: 📝 Embedding system already initialized, forcing indexing...");
+		// Reset the flag to ensure fresh indexing
+		initial_indexing_done = false;
+		// Start indexing immediately
+		call_deferred("_perform_initial_indexing");
+	}
 }
 
 void AIChatDock::_process_send_request_async() {
@@ -2429,136 +3026,41 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 	if (!p_message.attached_files.is_empty()) {
 		message_panel->set_visible(true);
 		
-		// Separate generated images from regular attachments
-		Vector<AttachedFile> regular_files;
-		Vector<AttachedFile> generated_images;
+		// Track displayed generated images to avoid duplication
+		HashSet<String> displayed_generated_images;
 		
+		// Display all attached files with unified UI
 		for (const AttachedFile &file : p_message.attached_files) {
-			if (file.path.begins_with("generated://")) {
-				generated_images.push_back(file);
-			} else {
-				regular_files.push_back(file);
-			}
-		}
-		
-		// Display generated images with special UI (same as when first generated)
-		if (!generated_images.is_empty()) {
-			for (const AttachedFile &file : generated_images) {
-				if (file.is_image && !file.base64_data.is_empty()) {
-					_display_generated_image_in_tool_result(message_vbox, file.base64_data, Dictionary());
-				}
-			}
-		}
-		
-		// Display regular attached files if any
-		if (!regular_files.is_empty()) {
-			VBoxContainer *files_container = memnew(VBoxContainer);
-			message_vbox->add_child(files_container);
-			
-			Label *files_header = memnew(Label);
-			files_header->set_text("Attached Files:");
-			files_header->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
-			files_header->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-			files_container->add_child(files_header);
-			
-			// Create a flow container for files to arrange them nicely
-			HFlowContainer *files_flow = memnew(HFlowContainer);
-			files_container->add_child(files_flow);
-			
-			for (const AttachedFile &file : regular_files) {
-			if (file.is_image) {
-				// Create image display with improved styling
-				PanelContainer *image_panel = memnew(PanelContainer);
-				files_flow->add_child(image_panel);
+			if (file.is_image && !file.base64_data.is_empty()) {
+				// Create metadata dictionary for unified display
+				Dictionary metadata;
+				metadata["name"] = file.name;
+				metadata["path"] = file.path;
+				metadata["mime_type"] = file.mime_type;
+				metadata["original_size_x"] = file.original_size.x;
+				metadata["original_size_y"] = file.original_size.y;
+				metadata["was_downsampled"] = file.was_downsampled;
 				
-				Ref<StyleBoxFlat> image_style = memnew(StyleBoxFlat);
-				image_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
-				image_style->set_border_width_all(2);
-				image_style->set_border_color(get_theme_color(SNAME("success_color"), SNAME("Editor")));
-				image_style->set_corner_radius_all(12);
-				image_style->set_content_margin_all(6);
-				image_style->set_shadow_color(Color(0, 0, 0, 0.2));
-				image_style->set_shadow_size(4);
-				image_panel->add_theme_style_override("panel", image_style);
-				
-				VBoxContainer *image_container = memnew(VBoxContainer);
-				image_panel->add_child(image_container);
-				
-				// Image preview
-				if (!file.base64_data.is_empty()) {
-					Vector<uint8_t> image_data = CoreBind::Marshalls::get_singleton()->base64_to_raw(file.base64_data);
-					if (image_data.size() > 0) {
-						Ref<Image> display_image = memnew(Image);
-						if (file.mime_type == "image/jpeg" || file.mime_type == "image/jpg") {
-							display_image->load_jpg_from_buffer(image_data);
-						} else {
-							display_image->load_png_from_buffer(image_data);
-						}
-						
-						if (!display_image->is_empty()) {
-							// Create display sized image (max 150px for chat)
-							Vector2i display_size = _calculate_downsampled_size(file.display_size, 150);
-							display_image->resize(display_size.x, display_size.y, Image::INTERPOLATE_LANCZOS);
-							
-							Ref<ImageTexture> display_texture = ImageTexture::create_from_image(display_image);
-							
-							TextureRect *image_display = memnew(TextureRect);
-							image_display->set_texture(display_texture);
-							image_display->set_expand_mode(TextureRect::EXPAND_FIT_WIDTH_PROPORTIONAL);
-							image_display->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
-							image_display->set_custom_minimum_size(Size2(display_size.x, display_size.y));
-							image_container->add_child(image_display);
-						}
-					}
+				// For generated images, track them to prevent duplication
+				if (file.path.begins_with("generated://")) {
+					displayed_generated_images.insert(file.base64_data);
 				}
 				
-				// Image info
-				HBoxContainer *image_info = memnew(HBoxContainer);
-				image_container->add_child(image_info);
+				_display_image_unified(message_vbox, file.base64_data, metadata);
+			} else if (!file.is_image) {
+				// Display non-image files with existing logic
+				VBoxContainer *files_container = memnew(VBoxContainer);
+				message_vbox->add_child(files_container);
 				
-				Label *image_icon = memnew(Label);
-				image_icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
-				image_info->add_child(image_icon);
+				Label *files_header = memnew(Label);
+				files_header->set_text("Attached Files:");
+				files_header->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+				files_header->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+				files_container->add_child(files_header);
 				
-				VBoxContainer *info_vbox = memnew(VBoxContainer);
-				image_info->add_child(info_vbox);
+				HFlowContainer *files_flow = memnew(HFlowContainer);
+				files_container->add_child(files_flow);
 				
-				Button *file_link = memnew(Button);
-				file_link->set_text(file.name);
-				file_link->set_flat(true);
-				file_link->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
-				file_link->set_tooltip_text("Click to open: " + file.path);
-				file_link->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_file_link_pressed).bind(file.path));
-				info_vbox->add_child(file_link);
-				
-				Label *size_info = memnew(Label);
-				String size_text = String::num_int64(file.display_size.x) + "×" + String::num_int64(file.display_size.y);
-				if (file.was_downsampled) {
-					size_text += " (resized)";
-				}
-				size_info->set_text(size_text);
-				size_info->add_theme_font_size_override("font_size", 10);
-				size_info->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
-				info_vbox->add_child(size_info);
-				
-				// Add spacer to push save button to the right
-				Control *spacer = memnew(Control);
-				spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-				image_info->add_child(spacer);
-				
-				// Save button for attached images
-				Button *save_button = memnew(Button);
-				save_button->set_text("Save");
-				save_button->set_flat(true);
-				save_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Save"), SNAME("EditorIcons")));
-				save_button->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-				save_button->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-				save_button->set_tooltip_text("Save this image to your project");
-				String image_format = (file.mime_type == "image/jpeg" || file.mime_type == "image/jpg") ? "jpg" : "png";
-				save_button->connect("pressed", callable_mp(this, &AIChatDock::_on_save_image_pressed).bind(file.base64_data, image_format));
-				image_info->add_child(save_button);
-			} else {
-				// Text file display
 				HBoxContainer *file_row = memnew(HBoxContainer);
 				files_flow->add_child(file_row);
 				
@@ -2575,10 +3077,12 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 				file_row->add_child(file_link);
 			}
 		}
-		}
+		
+		// Store displayed images to prevent duplication in tool_results section  
+		current_displayed_images = displayed_generated_images;
 	}
 	
-	// Display tool results (like generated images) if any
+	// Display tool results (like generated images) if any, but avoid duplication
 	if (!p_message.tool_results.is_empty()) {
 		message_panel->set_visible(true);
 		
@@ -2590,13 +3094,24 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 				String image_data = tool_result.get("image_data", "");
 				String prompt = tool_result.get("prompt", "Generated Image");
 				
-				if (!image_data.is_empty()) {
+				// Only display if not already displayed in attached_files section
+				if (!image_data.is_empty() && !current_displayed_images.has(image_data)) {
 					print_line("AI Chat: Displaying saved image from tool result: " + prompt + " (" + String::num(image_data.length()) + " chars base64)");
-					_display_generated_image_in_tool_result(message_vbox, image_data, tool_result);
+					
+					// Create metadata for unified display
+					Dictionary metadata;
+					metadata["prompt"] = prompt;
+					metadata["model"] = tool_result.get("model", "DALL-E");
+					metadata["path"] = "generated://tool_result";
+					
+					_display_image_unified(message_vbox, image_data, metadata);
 				}
 			}
 		}
 	}
+	
+	// Clear the displayed images set for next message
+	current_displayed_images.clear();
 
 	// Add spacing after each message panel
 	Control *spacer = memnew(Control);
@@ -3260,8 +3775,13 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 		String base64_data = p_result.get("image_data", "");
 		
 		if (!base64_data.is_empty()) {
-			// Display the generated image
-			_display_generated_image_in_tool_result(p_content_vbox, base64_data, p_result);
+			// Display the generated image with unified method
+			Dictionary metadata;
+			metadata["prompt"] = p_result.get("prompt", "Generated Image");
+			metadata["model"] = p_result.get("model", "DALL-E");
+			metadata["path"] = "generated://tool_operation";
+			
+			_display_image_unified(p_content_vbox, base64_data, metadata);
 		} else {
 			// Fallback to text display if no image data
 			RichTextLabel *content_label = memnew(RichTextLabel);
@@ -3271,6 +3791,115 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 			content_label->set_selection_enabled(true);
 			p_content_vbox->add_child(content_label);
 		}
+	} else if (p_tool_name == "search_across_project" && p_success) {
+		// Display search results with nice formatting
+		VBoxContainer *search_vbox = memnew(VBoxContainer);
+		p_content_vbox->add_child(search_vbox);
+
+		Dictionary results = p_result.get("results", Dictionary());
+		Array similar_files = results.get("similar_files", Array());
+		Array central_files = results.get("central_files", Array());
+		Dictionary graph_summary = results.get("graph_summary", Dictionary());
+		String query = p_args.get("query", "Unknown query");
+		
+		// Header with query info
+		Label *query_label = memnew(Label);
+		query_label->set_text("Search Results for: \"" + query + "\"");
+		query_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+		query_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+		search_vbox->add_child(query_label);
+		
+		search_vbox->add_child(memnew(HSeparator));
+		
+		// Similar files section
+		if (similar_files.size() > 0) {
+			Label *similar_header = memnew(Label);
+			similar_header->set_text("📁 Similar Files (" + String::num_int64(similar_files.size()) + ")");
+			similar_header->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+			search_vbox->add_child(similar_header);
+			
+			for (int i = 0; i < similar_files.size(); i++) {
+				Dictionary file_result = similar_files[i];
+				String file_path = file_result.get("file_path", "");
+				float similarity = file_result.get("similarity", 0.0);
+				String modality = file_result.get("modality", "text");
+				
+				HBoxContainer *file_hbox = memnew(HBoxContainer);
+				search_vbox->add_child(file_hbox);
+				
+				// File link button
+				Button *file_link = memnew(Button);
+				file_link->set_text(file_path);
+				file_link->set_flat(true);
+				file_link->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
+				file_link->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+				file_link->add_theme_icon_override("icon", get_theme_icon(SNAME("File"), SNAME("EditorIcons")));
+				file_link->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_file_link_pressed).bind(file_path));
+				file_hbox->add_child(file_link);
+				
+				// Similarity score
+				Label *score_label = memnew(Label);
+				score_label->set_text(String::num(similarity, 3) + " (" + modality + ")");
+				score_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
+				score_label->set_custom_minimum_size(Size2(120, 0));
+				file_hbox->add_child(score_label);
+			}
+		}
+		
+		// Central files section
+		if (central_files.size() > 0) {
+			search_vbox->add_child(memnew(HSeparator));
+			
+			Label *central_header = memnew(Label);
+			central_header->set_text("⭐ Central Files (" + String::num_int64(central_files.size()) + ")");
+			central_header->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+			search_vbox->add_child(central_header);
+			
+			for (int i = 0; i < central_files.size(); i++) {
+				Dictionary central_file = central_files[i];
+				String file_path = central_file.get("file_path", "");
+				float centrality = central_file.get("centrality", 0.0);
+				
+				HBoxContainer *central_hbox = memnew(HBoxContainer);
+				search_vbox->add_child(central_hbox);
+				
+				// File link button
+				Button *file_link = memnew(Button);
+				file_link->set_text(file_path);
+				file_link->set_flat(true);
+				file_link->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
+				file_link->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+				file_link->add_theme_icon_override("icon", get_theme_icon(SNAME("File"), SNAME("EditorIcons")));
+				file_link->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_file_link_pressed).bind(file_path));
+				central_hbox->add_child(file_link);
+				
+				// Centrality score
+				Label *centrality_label = memnew(Label);
+				centrality_label->set_text("Centrality: " + String::num(centrality, 3));
+				centrality_label->add_theme_color_override("font_color", get_theme_color(SNAME("warning_color"), SNAME("Editor")));
+				centrality_label->set_custom_minimum_size(Size2(120, 0));
+				central_hbox->add_child(centrality_label);
+			}
+		}
+		
+		// Graph summary section
+		if (!graph_summary.is_empty()) {
+			search_vbox->add_child(memnew(HSeparator));
+			
+			Label *graph_header = memnew(Label);
+			graph_header->set_text("🔗 Project Graph Summary");
+			graph_header->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+			search_vbox->add_child(graph_header);
+			
+			int total_files = graph_summary.get("total_files", 0);
+			int total_connections = graph_summary.get("total_connections", 0);
+			
+			Label *summary_label = memnew(Label);
+			summary_label->set_text("Files: " + String::num_int64(total_files) + " • Connections: " + String::num_int64(total_connections));
+			summary_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.8));
+			search_vbox->add_child(summary_label);
+		}
+		
 	} else {
 		// Default case - show formatted JSON output with better styling
 		VBoxContainer *json_container = memnew(VBoxContainer);
@@ -3759,6 +4388,13 @@ void AIChatDock::_finalize_chat_request() {
 
 	PackedStringArray headers;
 	headers.push_back("Content-Type: application/json");
+	
+	// Add authentication headers
+	if (!auth_token.is_empty()) {
+		headers.push_back("Authorization: Bearer " + auth_token);
+	}
+	headers.push_back("X-User-ID: " + current_user_id);
+	headers.push_back("X-Machine-ID: " + get_machine_id());
 
 	// Setup HTTPClient for streaming
 	http_client->set_read_chunk_size(4096); // 4kb chunk size
@@ -4128,8 +4764,8 @@ void AIChatDock::_load_conversations() {
 				file.content = file_dict.get("content", "");
 				file.is_image = file_dict.get("is_image", false);
 				file.mime_type = file_dict.get("mime_type", "");
-				// Skip loading base64_data on startup - load only when conversation is actually viewed
-				// file.base64_data = file_dict.get("base64_data", "");
+				// Load base64_data only when conversation is being displayed
+				file.base64_data = file_dict.get("base64_data", "");
 				file.original_size.x = file_dict.get("original_size_x", 0);
 				file.original_size.y = file_dict.get("original_size_y", 0);
 				file.display_size.x = file_dict.get("display_size_x", 0);
@@ -4406,6 +5042,9 @@ AIChatDock::AIChatDock() {
 	} else {
 		print_line("AI Chat Dock: Failed to start tool server on port 8001");
 	}
+	
+	// Initialize embedding system
+	call_deferred("_initialize_embedding_system");
 }
 
 
@@ -4876,6 +5515,130 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	tech_container->add_child(save_button);
 }
 
+void AIChatDock::_display_image_unified(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_metadata) {
+	if (!p_container || p_base64_data.is_empty()) {
+		return;
+	}
+	
+	// Decode base64 to image
+	Vector<uint8_t> image_data = CoreBind::Marshalls::get_singleton()->base64_to_raw(p_base64_data);
+	if (image_data.size() == 0) {
+		print_line("AI Chat: Failed to decode image data");
+		return;
+	}
+	
+	// Create image from data
+	Ref<Image> display_image = memnew(Image);
+	Error err = display_image->load_png_from_buffer(image_data);
+	if (err != OK) {
+		// Try JPEG if PNG fails
+		err = display_image->load_jpg_from_buffer(image_data);
+		if (err != OK) {
+			print_line("AI Chat: Failed to load image");
+			return;
+		}
+	}
+	
+	if (display_image->is_empty()) {
+		print_line("AI Chat: Image is empty");
+		return;
+	}
+	
+	// Create unified image display container
+	VBoxContainer *image_container = memnew(VBoxContainer);
+	p_container->add_child(image_container);
+	
+	// Extract metadata with defaults
+	String title = p_metadata.get("prompt", p_metadata.get("name", "Image"));
+	String model = p_metadata.get("model", "");
+	String file_path = p_metadata.get("path", "");
+	bool is_generated = file_path.begins_with("generated://");
+	int max_display_size = is_generated ? 200 : 150; // Generated images slightly larger
+	
+	// Add image title/info
+	HBoxContainer *info_container = memnew(HBoxContainer);
+	image_container->add_child(info_container);
+	
+	HBoxContainer *title_container = memnew(HBoxContainer);
+	info_container->add_child(title_container);
+	
+	Label *icon = memnew(Label);
+	icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
+	title_container->add_child(icon);
+	
+	Label *title_label = memnew(Label);
+	title_label->set_text(title);
+	title_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+	title_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+	title_container->add_child(title_label);
+	
+	// Resize image for display
+	Vector2i original_size = Vector2i(display_image->get_width(), display_image->get_height());
+	Vector2i display_size = _calculate_downsampled_size(original_size, max_display_size);
+	
+	if (display_size != original_size) {
+		display_image->resize(display_size.x, display_size.y, Image::INTERPOLATE_LANCZOS);
+	}
+	
+	// Create texture and display
+	Ref<ImageTexture> image_texture = ImageTexture::create_from_image(display_image);
+	
+	TextureRect *image_display = memnew(TextureRect);
+	image_display->set_texture(image_texture);
+	image_display->set_expand_mode(TextureRect::EXPAND_FIT_WIDTH_PROPORTIONAL);
+	image_display->set_stretch_mode(TextureRect::STRETCH_KEEP_ASPECT_CENTERED);
+	image_display->set_custom_minimum_size(Size2(display_size.x, display_size.y));
+	image_container->add_child(image_display);
+	
+	// Add technical details and controls
+	HBoxContainer *details_container = memnew(HBoxContainer);
+	image_container->add_child(details_container);
+	
+	// Size info
+	Label *size_label = memnew(Label);
+	size_label->set_text(String::num_int64(original_size.x) + "×" + String::num_int64(original_size.y));
+	size_label->add_theme_font_size_override("font_size", 10);
+	size_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
+	details_container->add_child(size_label);
+	
+	// Model info (for generated images)
+	if (!model.is_empty()) {
+		Label *model_label = memnew(Label);
+		model_label->set_text(" • " + model);
+		model_label->add_theme_font_size_override("font_size", 10);
+		model_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
+		details_container->add_child(model_label);
+	}
+	
+	// File path button (for attached images)
+	if (!file_path.is_empty() && !is_generated) {
+		Button *file_link = memnew(Button);
+		file_link->set_text(" • " + file_path.get_file());
+		file_link->set_flat(true);
+		file_link->add_theme_font_size_override("font_size", 10);
+		file_link->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+		file_link->set_tooltip_text("Click to open: " + file_path);
+		file_link->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_file_link_pressed).bind(file_path));
+		details_container->add_child(file_link);
+	}
+	
+	// Add spacer to push save button to the right
+	Control *spacer = memnew(Control);
+	spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	details_container->add_child(spacer);
+	
+	// Save button
+	Button *save_button = memnew(Button);
+	save_button->set_text("Save to...");
+	save_button->set_flat(true);
+	save_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Save"), SNAME("EditorIcons")));
+	save_button->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+	save_button->add_theme_color_override("icon_normal_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+	save_button->set_tooltip_text("Save this image to your project");
+	save_button->connect("pressed", callable_mp(this, &AIChatDock::_on_save_image_pressed).bind(p_base64_data, "png"));
+	details_container->add_child(save_button);
+}
+
 void AIChatDock::_on_save_image_pressed(const String &p_base64_data, const String &p_format) {
 	if (p_base64_data.is_empty()) {
 		return;
@@ -5256,6 +6019,17 @@ String AIChatDock::_get_node_info_string(Node *p_node) {
 	}
 	
 	return info;
+}
+
+String AIChatDock::get_machine_id() const {
+	// Generate a unique machine ID based on hardware characteristics
+	String machine_id = OS::get_singleton()->get_unique_id();
+	if (machine_id.is_empty()) {
+		// Fallback to processor name + OS name
+		machine_id = OS::get_singleton()->get_processor_name() + "_" + OS::get_singleton()->get_name();
+		machine_id = machine_id.replace(" ", "_").replace("(", "").replace(")", "");
+	}
+	return machine_id;
 }
 
 AIChatDock::~AIChatDock() {

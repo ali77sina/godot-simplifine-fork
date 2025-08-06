@@ -56,6 +56,7 @@ public:
 	static Dictionary check_node_in_scene_tree(const Dictionary &p_args);
 	static Dictionary inspect_animation_state(const Dictionary &p_args);
 	static Dictionary get_layers_and_zindex(const Dictionary &p_args);
+	static Dictionary search_across_project(const Dictionary &p_args);
 
 	// Universal Tools (New Consolidated API)
 	static Dictionary universal_node_manager(const Dictionary &p_args);

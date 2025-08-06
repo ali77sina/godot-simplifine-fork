@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, redirect, session
 import openai
 import json
 import os
@@ -10,6 +10,8 @@ import requests
 from threading import Lock
 import uuid
 import time
+from multimodal_embedding_manager import MultimodalEmbeddingManager
+from auth_manager import AuthManager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -33,6 +35,7 @@ def cleanup_old_requests():
             del ACTIVE_REQUESTS[req_id]
 
 app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
 
 # Get OpenAI API key from environment variable
 api_key = os.getenv('OPENAI_API_KEY')
@@ -43,6 +46,59 @@ client = openai.OpenAI(api_key=api_key)
 
 # Model configuration
 MODEL = "gpt-4o"  # Using GPT-4o which supports function calling
+
+# Initialize Authentication Manager
+auth_manager = AuthManager()
+
+# Initialize Multimodal Embedding Manager
+GCP_BUCKET_NAME = os.getenv('GCP_BUCKET_NAME', 'godot-ai-embeddings')
+GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
+if not GCP_PROJECT_ID:
+    raise ValueError("GCP_PROJECT_ID environment variable is required")
+
+# User-specific embedding managers (cached)
+embedding_managers = {}
+
+def get_embedding_manager(user_id: str, project_root: str):
+    """Get or create user-specific embedding manager instance"""
+    cache_key = f"{user_id}:{project_root}"
+    if cache_key not in embedding_managers:
+        embedding_managers[cache_key] = MultimodalEmbeddingManager(
+            client, GCP_BUCKET_NAME, project_root, user_id, GCP_PROJECT_ID
+        )
+    return embedding_managers[cache_key]
+
+def verify_authentication():
+    """Verify user authentication from request (with dev mode bypass)"""
+    # DEV MODE: Allow bypass for testing
+    if os.getenv('DEV_MODE', 'false').lower() == 'true':
+        # Check headers first, then JSON
+        user_id = request.headers.get('X-User-ID')
+        if not user_id:
+            data = request.json if request.json else {}
+            user_id = data.get('user_id')
+        if user_id:
+            print(f"🧪 DEV MODE: Bypassing auth for user {user_id}")
+            return {
+                "id": user_id,
+                "name": "Test User",
+                "email": "test@example.com",
+                "provider": "dev_mode"
+            }, None, None
+    
+    auth_header = request.headers.get('Authorization', '')
+    machine_id = request.headers.get('X-Machine-ID') or (request.json.get('machine_id') if request.json else None)
+    
+    if not machine_id:
+        return None, {"error": "machine_id required", "success": False}, 401
+    
+    if auth_header.startswith('Bearer '):
+        token = auth_header[7:]
+        user = auth_manager.verify_session(machine_id, token)
+        if user:
+            return user, None, None
+    
+    return None, {"error": "Authentication required", "success": False}, 401
 
 # Image handling will use OpenAI's native ID system - no local registry needed
 
@@ -176,6 +232,86 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
         print(f"IMAGE_OP ERROR: {str(e)}")
         return {"success": False, "error": f"Image operation failed: {str(e)}"}
 
+# --- Search Across Project Function ---
+def search_across_project_internal(arguments: dict, current_user: dict = None) -> dict:
+    """Execute search across project using the embedding system"""
+    try:
+        query = arguments.get('query', '')
+        if not query:
+            return {"success": False, "error": "Query parameter is required"}
+        
+        # Get parameters
+        include_graph = arguments.get('include_graph', True)
+        max_results = arguments.get('max_results', 5)
+        modality_filter = arguments.get('modality_filter')
+        
+        # Get authentication from current request context or use provided user
+        if current_user is None:
+            user, error_response, status_code = verify_authentication()
+            if error_response:
+                return {"success": False, "error": "Authentication required"}
+        else:
+            user = current_user
+        
+        # Get project root from arguments or use a default
+        project_root = arguments.get('project_root', '/Users/alikavoosi/Desktop/3d-design/game-from-scratch-project/new-game-project')
+        
+        # Get user-specific embedding manager
+        em = get_embedding_manager(user['id'], project_root)
+        
+        if include_graph:
+            # Enhanced search with graph context
+            results = em.search_with_graph_context(query, max_results, include_connected=True)
+            
+            # Format for tool response
+            formatted_results = {
+                "similar_files": [
+                    {
+                        "file_path": path,
+                        "similarity": float(score),
+                        "modality": modality,
+                        "connections": results['connected_files'].get(path, {})
+                    }
+                    for path, score, modality in results['similarity_results']
+                ],
+                "central_files": [
+                    {
+                        "file_path": path,
+                        "centrality": float(score)
+                    }
+                    for path, score in results['central_files']
+                ],
+                "graph_summary": results['graph_summary']
+            }
+        else:
+            # Regular similarity search
+            similarity_results = em.search_similar_files(query, max_results, modality_filter)
+            formatted_results = {
+                "similar_files": [
+                    {
+                        "file_path": path,
+                        "similarity": float(score),
+                        "modality": modality
+                    }
+                    for path, score, modality in similarity_results
+                ],
+                "central_files": [],
+                "graph_summary": {}
+            }
+        
+        return {
+            "success": True,
+            "query": query,
+            "results": formatted_results,
+            "include_graph": include_graph,
+            "file_count": len(formatted_results["similar_files"]),
+            "message": f"Found {len(formatted_results['similar_files'])} relevant files for query: {query}"
+        }
+        
+    except Exception as e:
+        print(f"SEARCH_PROJECT_INTERNAL_ERROR: {e}")
+        return {"success": False, "error": f"Search failed: {str(e)}"}
+
 # --- Note: Script generation now handled by dedicated /generate_script endpoint ---
 
 # --- Tool Execution Function ---
@@ -185,6 +321,8 @@ def execute_godot_tool(function_name: str, arguments: dict) -> dict:
         return image_operation_internal(arguments)
     elif function_name == "asset_processor":
         return process_asset_internal(arguments)
+    elif function_name == "search_across_project":
+        return search_across_project_internal(arguments)
     else:
         # This shouldn't happen if we filter correctly
         print(f"WARNING: Unknown backend tool called: {function_name}")
@@ -730,6 +868,37 @@ godot_tools = [
                 "required": ["path", "prompt"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_across_project",
+            "description": "Search for relevant files across the entire project using semantic similarity and relationship context. Perfect for understanding how systems work, finding related code, or discovering project structure. Includes graph relationships showing how files connect.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query describing what you're looking for (e.g., 'player movement', 'UI system', 'audio handling')"
+                    },
+                    "include_graph": {
+                        "type": "boolean",
+                        "description": "Include relationship graph context showing how files connect",
+                        "default": True
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of similar files to return",
+                        "default": 5
+                    },
+                    "modality_filter": {
+                        "type": "string",
+                        "description": "Filter by file type: 'text' (scripts/scenes), 'image', 'audio', or null for all types"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
     }
 ]
 
@@ -761,6 +930,11 @@ def chat():
     3. Executes any tool calls
     4. Streams the final response back to Godot
     """
+    # Verify authentication
+    user, error_response, status_code = verify_authentication()
+    if error_response:
+        return error_response, status_code
+    
     data = request.json
     messages = data.get('messages', [])
 
@@ -919,11 +1093,11 @@ def chat():
 
                 # Now that we've processed all chunks, handle the results
 
-                # --- Backend-Only Tool Execution (Image Generation) ---
-                backend_tools_detected = [func.get("name") for func in tool_call_aggregator.values() if func.get("name") == "image_operation"]
+                # --- Backend-Only Tool Execution (Image Generation + Search) ---
+                backend_tools_detected = [func.get("name") for func in tool_call_aggregator.values() if func.get("name") in ["image_operation", "search_across_project"]]
                 print(f"BACKEND_DETECTION: Found {len(backend_tools_detected)} backend tools: {backend_tools_detected}")
                 
-                if any(func.get("name") == "image_operation" for func in tool_call_aggregator.values()):
+                if any(func.get("name") in ["image_operation", "search_across_project"] for func in tool_call_aggregator.values()):
                     # This is a backend-only tool call, so we will execute it,
                     # add the results to the conversation, and loop again for the AI's final response.
                     
@@ -982,6 +1156,47 @@ def chat():
                                 "tool_call_id": tool_id,
                                 "role": "tool",
                                 "name": "image_operation",
+                                "content": json.dumps(tool_result_for_openai),
+                            })
+                        
+                        elif func["name"] == "search_across_project":
+                            # Check for stop before tool execution
+                            if check_stop():
+                                print(f"STOP_DETECTED: Request {request_id} stopped before tool execution")
+                                yield json.dumps({"status": "stopped", "message": "Request stopped before tool execution"}) + '\n'
+                                return
+                            
+                            yield json.dumps({"tool_starting": "search_across_project", "tool_id": tool_id, "status": "tool_starting"}) + '\n'
+                            try:
+                                arguments = json.loads(func["arguments"])
+                            except json.JSONDecodeError:
+                                arguments = {}
+                            
+                            # Execute the search operation (pass current user context)
+                            search_result = search_across_project_internal(arguments, current_user=user)
+                            
+                            # Check for stop after tool execution
+                            if check_stop():
+                                print(f"STOP_DETECTED: Request {request_id} stopped after tool execution")
+                                yield json.dumps({"status": "stopped", "message": "Request stopped after tool execution"}) + '\n'
+                                return
+                            
+                            # Yield result to frontend immediately
+                            yield json.dumps({"tool_executed": "search_across_project", "tool_result": search_result, "tool_call_id": tool_id, "status": "tool_completed"}) + '\n'
+                            
+                            # Prepare tool result for conversation history
+                            tool_result_for_openai = {
+                                "success": search_result.get("success"),
+                                "query": search_result.get("query"),
+                                "file_count": search_result.get("file_count", 0),
+                                "message": search_result.get("message"),
+                                "similar_files": search_result.get("results", {}).get("similar_files", [])[:3]  # Limit to first 3 for token efficiency
+                            }
+                            
+                            tool_results_for_history.append({
+                                "tool_call_id": tool_id,
+                                "role": "tool",
+                                "name": "search_across_project",
                                 "content": json.dumps(tool_result_for_openai),
                             })
                 
@@ -1204,6 +1419,370 @@ Return the complete edited file content (no explanations, just the code):"""
             "error": str(e),
             "success": False
         }), 500
+
+@app.route('/auth/login', methods=['GET'])
+def auth_login():
+    """Start OAuth authentication process"""
+    try:
+        machine_id = request.args.get('machine_id')
+        provider = request.args.get('provider', 'google')  # Default to Google
+        
+        if not machine_id:
+            return jsonify({"error": "machine_id parameter required"}), 400
+        
+        if provider == 'google':
+            auth_url = auth_manager.get_google_auth_url(machine_id)
+        elif provider == 'github':
+            auth_url = auth_manager.get_github_auth_url(machine_id)
+        else:
+            return jsonify({"error": "Unsupported provider"}), 400
+        
+        return redirect(auth_url)
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/auth/callback', methods=['GET'])
+@app.route('/api/auth/callback', methods=['GET'])
+def auth_callback():
+    """Handle OAuth callback"""
+    try:
+        state = request.args.get('state')
+        code = request.args.get('code')
+        error = request.args.get('error')
+        
+        if error:
+            return f"<html><body><h1>Authentication Error</h1><p>{error}</p></body></html>", 400
+        
+        if not state or not code:
+            return "<html><body><h1>Authentication Error</h1><p>Missing state or code parameter</p></body></html>", 400
+        
+        # Determine provider from pending auth
+        pending = auth_manager.pending_auth.get(state)
+        if not pending:
+            return "<html><body><h1>Authentication Error</h1><p>Invalid or expired state</p></body></html>", 400
+        
+        provider = pending['provider']
+        
+        print(f"Processing {provider} callback for state: {state}")
+        
+        if provider == 'google':
+            result = auth_manager.handle_google_callback(state, code)
+        elif provider == 'github':
+            result = auth_manager.handle_github_callback(state, code)
+        else:
+            return "<html><body><h1>Authentication Error</h1><p>Invalid provider</p></body></html>", 400
+        
+        print(f"Auth result: {result}")
+        
+        if result['success']:
+            user = result['user']
+            return f"""
+            <html>
+            <body>
+                <h1>Authentication Successful!</h1>
+                <p>Welcome, {user['name']}!</p>
+                <p>You can now close this window and return to Godot.</p>
+                <script>window.close();</script>
+            </body>
+            </html>
+            """
+        else:
+            return f"<html><body><h1>Authentication Failed</h1><p>{result['error']}</p></body></html>", 400
+            
+    except Exception as e:
+        return f"<html><body><h1>Authentication Error</h1><p>{str(e)}</p></body></html>", 500
+
+@app.route('/auth/status', methods=['POST'])
+def auth_status():
+    """Check authentication status for a machine"""
+    try:
+        data = request.json
+        machine_id = data.get('machine_id')
+        
+        if not machine_id:
+            return jsonify({"error": "machine_id required", "success": False}), 400
+        
+        user_data = auth_manager.get_user_by_machine_id(machine_id)
+        
+        if user_data:
+            return jsonify({
+                "success": True,
+                "user": user_data['user'],
+                "token": user_data['token']
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Not authenticated"
+            }), 401
+            
+    except Exception as e:
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/auth/logout', methods=['POST'])
+def auth_logout():
+    """Logout user"""
+    try:
+        data = request.json
+        machine_id = data.get('machine_id')
+        user_id = data.get('user_id')
+        
+        if not machine_id:
+            return jsonify({"error": "machine_id required", "success": False}), 400
+        
+        success = auth_manager.logout_user(machine_id, user_id)
+        
+        return jsonify({
+            "success": success,
+            "message": "Logged out successfully" if success else "No active session found"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/embed', methods=['POST'])
+def embed_endpoint():
+    """
+    Multimodal embedding endpoint for managing project file embeddings with user authentication
+    
+    Actions:
+    - index_project: Index all project files
+    - index_file: Index specific file
+    - remove_file: Remove file from index
+    - search: Search for similar files with optional modality filtering
+    - status: Get project summary
+    - update_file: Update specific file embedding
+    """
+    try:
+        # Verify authentication
+        user, error_response, status_code = verify_authentication()
+        if error_response:
+            return jsonify(error_response), status_code
+        
+        data = request.json
+        action = data.get('action')
+        project_root = data.get('project_root')
+        
+        if not action:
+            return jsonify({"error": "No action specified"}), 400
+        
+        if not project_root:
+            return jsonify({"error": "project_root required"}), 400
+        
+        # Get user-specific embedding manager
+        em = get_embedding_manager(user['id'], project_root)
+        
+        if action == 'index_project':
+            force_reindex = data.get('force_reindex', False)
+            stats = em.index_project(force_reindex=force_reindex)
+            return jsonify({
+                "success": True,
+                "action": "index_project",
+                "stats": stats
+            })
+        
+        elif action == 'index_file':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for index_file action"}), 400
+            
+            indexed = em.index_file(file_path)
+            return jsonify({
+                "success": True,
+                "action": "index_file",
+                "file_path": file_path,
+                "indexed": indexed
+            })
+        
+        elif action == 'update_file':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for update_file action"}), 400
+            
+            updated = em.update_file(file_path)
+            return jsonify({
+                "success": True,
+                "action": "update_file",
+                "file_path": file_path,
+                "updated": updated
+            })
+        
+        elif action == 'remove_file':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for remove_file action"}), 400
+            
+            removed = em.remove_file(file_path)
+            return jsonify({
+                "success": True,
+                "action": "remove_file",
+                "file_path": file_path,
+                "removed": removed
+            })
+        
+        elif action == 'search':
+            query = data.get('query')
+            if not query:
+                return jsonify({"error": "query required for search action"}), 400
+            
+            k = data.get('k', 5)
+            modality_filter = data.get('modality_filter')  # Optional: 'text', 'image', 'audio'
+            include_graph = data.get('include_graph', False)  # Include graph relationships
+            
+            if include_graph:
+                # Enhanced search with graph context
+                results = em.search_with_graph_context(query, k, include_connected=True)
+                return jsonify({
+                    "success": True,
+                    "action": "search_with_graph",
+                    "query": query,
+                    "results": results
+                })
+            else:
+                # Regular similarity search
+                results = em.search_similar_files(query, k, modality_filter)
+                return jsonify({
+                    "success": True,
+                    "action": "search",
+                    "query": query,
+                    "modality_filter": modality_filter,
+                    "results": [{"file_path": path, "similarity": score, "modality": modality} for path, score, modality in results]
+                })
+        
+        elif action == 'status':
+            summary = em.get_project_summary()
+            graph_summary = em.get_graph_summary()
+            return jsonify({
+                "success": True,
+                "action": "status",
+                "summary": summary,
+                "graph": graph_summary
+            })
+        
+        elif action == 'graph_connections':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for graph_connections action"}), 400
+            
+            max_depth = data.get('max_depth', 2)
+            connections = em.get_connected_files(file_path, max_depth)
+            
+            return jsonify({
+                "success": True,
+                "action": "graph_connections",
+                "file_path": file_path,
+                "max_depth": max_depth,
+                "connections": connections
+            })
+        
+        elif action == 'central_files':
+            top_k = data.get('top_k', 10)
+            central_files = em.get_central_files(top_k)
+            
+            return jsonify({
+                "success": True,
+                "action": "central_files",
+                "central_files": [{"file_path": path, "centrality": score} for path, score in central_files]
+            })
+        
+        else:
+            return jsonify({"error": f"Unknown action: {action}"}), 400
+    
+    except Exception as e:
+        print(f"EMBED_ERROR: {e}")
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
+@app.route('/search_project', methods=['POST'])
+def search_project():
+    """
+    Search across project files using semantic similarity and graph context
+    Used by the search_across_project tool
+    """
+    try:
+        # Verify authentication (with dev mode bypass)
+        user, error_response, status_code = verify_authentication()
+        if error_response:
+            return jsonify(error_response), status_code
+        
+        data = request.json
+        query = data.get('query')
+        project_root = data.get('project_root')
+        
+        if not query:
+            return jsonify({"error": "Query required"}), 400
+        if not project_root:
+            return jsonify({"error": "project_root required"}), 400
+        
+        # Get search parameters
+        include_graph = data.get('include_graph', True)
+        max_results = data.get('max_results', 5)
+        modality_filter = data.get('modality_filter')
+        
+        # Get user-specific embedding manager
+        em = get_embedding_manager(user['id'], project_root)
+        
+        if include_graph:
+            # Enhanced search with graph context
+            results = em.search_with_graph_context(query, max_results, include_connected=True)
+            
+            # Format for tool response
+            formatted_results = {
+                "similar_files": [
+                    {
+                        "file_path": path,
+                        "similarity": float(score),
+                        "modality": modality,
+                        "connections": results['connected_files'].get(path, {})
+                    }
+                    for path, score, modality in results['similarity_results']
+                ],
+                "central_files": [
+                    {
+                        "file_path": path,
+                        "centrality": float(score)
+                    }
+                    for path, score in results['central_files']
+                ],
+                "graph_summary": results['graph_summary']
+            }
+        else:
+            # Regular similarity search
+            similarity_results = em.search_similar_files(query, max_results, modality_filter)
+            formatted_results = {
+                "similar_files": [
+                    {
+                        "file_path": path,
+                        "similarity": float(score),
+                        "modality": modality
+                    }
+                    for path, score, modality in similarity_results
+                ],
+                "central_files": [],
+                "graph_summary": {}
+            }
+        
+        return jsonify({
+            "success": True,
+            "query": query,
+            "results": formatted_results,
+            "include_graph": include_graph
+        })
+        
+    except Exception as e:
+        print(f"SEARCH_PROJECT_ERROR: {e}")
+        return jsonify({
+            "error": str(e),
+            "success": False
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint for testing"""
+    return jsonify({"status": "healthy", "service": "godot-ai-embedding-service"})
 
 if __name__ == '__main__':
     # Use PORT environment variable for Cloud Run, fallback to 8000 for local dev

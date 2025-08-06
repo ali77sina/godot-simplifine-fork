@@ -141,6 +141,24 @@ private:
 	EditorFileDialog *file_dialog = nullptr;
 	EditorFileDialog *save_image_dialog = nullptr;
 	AcceptDialog *image_warning_dialog = nullptr;
+	
+	// Embedding system state
+	HTTPRequest *embedding_request = nullptr;
+	bool embedding_system_initialized = false;
+	bool initial_indexing_done = false;
+	
+	// User authentication
+	HTTPRequest *auth_request = nullptr;
+	Button *login_button = nullptr;
+	Label *user_status_label = nullptr;
+	String current_user_id;
+	String current_user_name;
+	String auth_token;
+	
+	// Login polling
+	Timer *login_poll_timer = nullptr;
+	int login_poll_attempts = 0;
+	int login_poll_max_attempts = 30;
 	PopupPanel *at_mention_popup = nullptr;
 	Tree *at_mention_tree = nullptr;
 	PopupPanel *scene_tree_popup = nullptr;
@@ -190,6 +208,9 @@ private:
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;
+	
+	// Track displayed images to prevent duplication
+	HashSet<String> current_displayed_images;
 	
 	// Stop mechanism
 	String current_request_id;
@@ -299,6 +320,9 @@ private:
 	void _display_generated_image_deferred(const String &p_base64_data, const String &p_id);
 	void _display_generated_image_in_tool_result(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_data);
 	
+	// Unified image display method for all image types
+	void _display_image_unified(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_metadata = Dictionary());
+	
 	// Drag and drop support
 	bool can_drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from) const;
 	void drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from);
@@ -320,6 +344,37 @@ private:
 	void _create_backend_tool_placeholder(const String &p_tool_id, const String &p_tool_name);
 	void _create_assistant_message_for_backend_tool(const String &p_tool_name);
 	void _create_assistant_message_with_tool_placeholder(const String &p_tool_name, const String &p_tool_id);
+	
+	// Embedding system for project indexing
+	void _initialize_embedding_system();
+	void _perform_initial_indexing();
+	void _on_filesystem_changed();
+	void _on_sources_changed(bool p_exist);
+	void _update_file_embedding(const String &p_file_path);
+	void _remove_file_embedding(const String &p_file_path);
+	void _send_embedding_request(const String &p_action, const Dictionary &p_data = Dictionary());
+	void _on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
+	bool _should_index_file(const String &p_file_path);
+	String _get_project_root_path();
+	
+	// Smart context attachment based on embeddings
+	void _suggest_relevant_files(const String &p_query);
+	void _auto_attach_relevant_context();
+	
+	// User authentication methods
+	void _setup_authentication_ui();
+	void _on_login_button_pressed();
+	void _on_auth_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
+	void _on_auth_dialog_action(const StringName &p_action);
+	void _check_authentication_status();
+	void _auto_verify_saved_credentials();
+	void _start_login_polling();
+	void _poll_login_status();
+	void _stop_login_polling();
+	void _ensure_project_indexing();
+	void _update_user_status();
+	void _logout_user();
+	bool _is_user_authenticated() const;
 
 protected:
 	void _notification(int p_notification);
@@ -335,4 +390,9 @@ public:
 	void set_api_endpoint(const String &p_endpoint);
 	void set_model(const String &p_model);
 	void send_error_message(const String &p_error_text);
+	
+	// Authentication getters for EditorTools
+	String get_current_user_id() const { return current_user_id; }
+	String get_machine_id() const;
+	String get_auth_token() const { return auth_token; }
 }; 
