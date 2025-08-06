@@ -35,21 +35,29 @@
 #include "scene/gui/box_container.h"
 #include "scene/gui/texture_rect.h"
 #include "scene/gui/dialogs.h"
+#include "scene/main/http_request.h"
 #include "diff_viewer.h"
 #include "ai_tool_server.h"
 #include "common.h"
 
 class Button;
+class MenuButton;
 class ConfigFile;
 class EditorFileDialog;
+class EditorFileSystemDirectory;
 class EditorTools;
 class HTTPClient;
+class HTTPRequest;
 class Node;
 class OptionButton;
 class RichTextLabel;
 class ScrollContainer;
 class StyleBoxFlat;
 class TextEdit;
+class Tree;
+class TreeItem;
+class PopupPanel;
+class PopupMenu;
 class DiffViewer;
 class ScriptEditor;
 class ScriptTextEditor;
@@ -79,13 +87,7 @@ private:
 		return nullptr;
 	}
 
-	enum RequestStatus {
-		STATUS_IDLE,
-		STATUS_CONNECTING,
-		STATUS_REQUESTING,
-		STATUS_BODY,
-		STATUS_DONE,
-	};
+
 
 	struct AttachedFile {
 		String path;
@@ -133,23 +135,51 @@ private:
 	Button *new_conversation_button = nullptr;
 	TextEdit *input_field = nullptr;
 	Button *send_button = nullptr;
-	Button *attach_button = nullptr;
+	Button *stop_button = nullptr;
+	MenuButton *attach_button = nullptr;
 	HFlowContainer *attached_files_container = nullptr;
 	EditorFileDialog *file_dialog = nullptr;
 	EditorFileDialog *save_image_dialog = nullptr;
 	AcceptDialog *image_warning_dialog = nullptr;
+	PopupPanel *at_mention_popup = nullptr;
+	Tree *at_mention_tree = nullptr;
+	PopupPanel *scene_tree_popup = nullptr;
+	Tree *scene_tree = nullptr;
+	EditorFileDialog *resource_dialog = nullptr;
 	
 	// For saving images
 	String pending_save_image_data; // Base64 image data to save
 	String pending_save_image_format; // "png" or "jpg"
+	
+	// For delayed saving performance optimization
+	bool save_pending = false;
+	
+	// Background saving to prevent UI freezing
+	Thread *save_thread = nullptr;
+	Mutex *save_mutex = nullptr;
+	bool save_thread_busy = false;
 
+	// Streaming HTTP client (replaces HTTPRequest for streaming support)
 	Ref<HTTPClient> http_client;
-	RequestStatus http_status = STATUS_IDLE;
+	// Separate HTTP request for stop requests (non-streaming)
+	HTTPRequest *stop_http_request = nullptr;
+	enum HTTPStatus {
+		STATUS_IDLE,
+		STATUS_CONNECTING,
+		STATUS_REQUESTING,
+		STATUS_BODY,
+		STATUS_DONE
+	};
+	HTTPStatus http_status = STATUS_IDLE;
 	String pending_request_path;
 	PackedStringArray pending_request_headers;
 	PackedByteArray pending_request_body;
+	
 	RichTextLabel *current_assistant_message_label = nullptr;
 	String response_buffer;
+	Array _chunked_messages; // For processing large conversations in chunks
+	Array _chunked_conversations_array; // For async saving
+	int _chunked_save_index = 0;
 
 	Vector<Conversation> conversations;
 	int current_conversation_index = -1;
@@ -160,30 +190,67 @@ private:
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;
+	
+	// Stop mechanism
+	String current_request_id;
+	bool stop_requested = false;
+	bool stream_completed_successfully = false;
+	// Timer to defer heavy conversation save to idle time
+	Timer *save_timer = nullptr;
 
 	void _on_send_button_pressed();
+	void _on_stop_button_pressed();
+	void _process_send_request_async();
+	void _send_stop_request();
+	void _on_stop_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
+	void _on_edit_message_pressed(int p_message_index);
+	void _on_edit_message_send_pressed(int p_message_index, const String &p_new_content);
+	void _on_edit_send_button_pressed(Button *p_button);
+	void _on_edit_message_cancel_pressed(int p_message_index);
+	void _on_edit_field_gui_input(const Ref<InputEvent> &p_event, Button *p_send_button);
+	void _create_edit_message_bubble(const ChatMessage &p_message, int p_message_index);
+	void _save_conversations_async();
 	void _on_input_text_changed();
 	void _on_input_field_gui_input(const Ref<InputEvent> &p_event);
+	void _update_at_mention_popup();
+	void _populate_at_mention_tree(const String &p_filter = "");
+	void _populate_tree_recursive(EditorFileSystemDirectory *p_dir, TreeItem *p_parent, const String &p_filter);
+	void _on_at_mention_item_selected();
 	void _on_model_selected(int p_index);
 	void _on_tool_output_toggled(Control *p_content);
-	void _on_attach_button_pressed();
+	void _on_attachment_menu_item_pressed(int p_id);
+	void _on_attach_files_pressed();
+	void _on_attach_scene_nodes_pressed();
+	void _on_attach_current_script_pressed();
+	void _on_attach_resources_pressed();
+	void _on_scene_tree_node_selected();
 	void _on_files_selected(const Vector<String> &p_files);
 	void _on_remove_attachment(const String &p_path);
 	void _on_conversation_selected(int p_index);
 	void _on_new_conversation_pressed();
 	void _on_save_image_pressed(const String &p_base64_data, const String &p_format);
-	void _on_save_image_location_selected(const Vector<String> &p_files);
+	void _on_save_image_location_selected(const String &p_file_path);
+	void _save_conversations_to_disk(const String &p_json_data);
+	void _process_image_attachment_async(const String &p_file_path, const String &p_name, const String &p_mime_type);
 	void _handle_response_chunk(const PackedByteArray &p_chunk);
 	void _process_ndjson_line(const String &p_line);
 	void _execute_tool_calls(const Array &p_tool_calls);
 	RichTextLabel *_get_or_create_current_assistant_message_label();
 	void _create_tool_call_bubbles(const Array &p_tool_calls);
+	void _update_tool_placeholder_with_result(const ChatMessage &p_tool_message);
+	void _create_tool_specific_ui(VBoxContainer *p_content_vbox, const String &p_tool_name, const Dictionary &p_result, bool p_success, const Dictionary &p_args = Dictionary());
+	void _rebuild_conversation_ui(const Vector<ChatMessage> &p_messages);
+	void _apply_tool_result_deferred(const String &p_tool_call_id, const String &p_tool_name, const String &p_content, const Array &p_tool_results);
+	void _build_hierarchy_tree_item(Tree *p_tree, TreeItem *p_parent, const Dictionary &p_node_data);
 
 	void _add_message_to_chat(const String &p_role, const String &p_content, const Array &p_tool_calls = Array());
 	void _add_tool_response_to_chat(const String &p_tool_call_id, const String &p_name, const Dictionary &p_args, const Dictionary &p_result);
 	void _send_chat_request();
+	void _send_chat_request_chunked(int p_start_index);
+	Dictionary _build_api_message(const ChatMessage &p_msg);
+	void _finalize_chat_request();
 	void _update_ui_state();
-	void _create_message_bubble(const AIChatDock::ChatMessage &p_message);
+	void _create_message_bubble(const AIChatDock::ChatMessage &p_message, int p_message_index = -1);
 	void _update_attached_files_display();
 	void _clear_attachments();
 	String _get_timestamp();
@@ -192,7 +259,14 @@ private:
 	// Conversation management
 	void _load_conversations();
 	void _save_conversations();
+	void _save_conversations_chunked(int p_start_index);
+	void _finalize_conversations_save();
+	void _queue_delayed_save();
+	void _execute_delayed_save();
+	static void _background_save(void *p_userdata);
+	void _on_background_save_finished();
 	void _create_new_conversation();
+	void _create_new_conversation_instant();
 	void _switch_to_conversation(int p_index);
 	void _update_conversation_dropdown();
 	String _generate_conversation_id();
@@ -215,6 +289,9 @@ private:
 	String _get_mime_type_from_extension(const String &p_path);
 	bool _process_image_attachment(AttachedFile &p_file);
 	Vector2i _calculate_downsampled_size(const Vector2i &p_original, int p_max_dimension = 1024);
+	
+	// UI validation helpers
+	bool _is_label_descendant_of_node(Node *p_label, Node *p_node);
 	void _show_image_warning_dialog(const String &p_filename, const Vector2i &p_original, const Vector2i &p_new_size);
 	
 	// Image generation handling
@@ -231,17 +308,31 @@ private:
 	void _attach_external_files(const Vector<String> &p_files);
 	void _attach_dragged_nodes(const Array &p_nodes);
 	String _get_file_type_icon(const AttachedFile &p_file);
+	
+	// Attachment helpers
+	void _attach_scene_node(Node *p_node);
+	void _attach_current_script();
+	void _populate_scene_tree_recursive(Node *p_node, TreeItem *p_parent);
+	String _get_node_info_string(Node *p_node);
+	
+	// Tool execution feedback
+	void _update_tool_placeholder_status(const String &p_tool_id, const String &p_tool_name, const String &p_status);
+	void _create_backend_tool_placeholder(const String &p_tool_id, const String &p_tool_name);
+	void _create_assistant_message_for_backend_tool(const String &p_tool_name);
+	void _create_assistant_message_with_tool_placeholder(const String &p_tool_name, const String &p_tool_id);
 
 protected:
 	void _notification(int p_notification);
 	static void _bind_methods();
 
 public:
+	AIChatDock();
+	~AIChatDock();
+	
 	void clear_chat_history();
 	void clear_current_conversation();
 	void set_api_key(const String &p_api_key);
 	void set_api_endpoint(const String &p_endpoint);
 	void set_model(const String &p_model);
-
-	AIChatDock();
+	void send_error_message(const String &p_error_text);
 }; 
