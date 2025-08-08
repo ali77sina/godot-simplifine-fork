@@ -10,6 +10,7 @@ import requests
 from threading import Lock
 import uuid
 import time
+import tempfile
 from multimodal_embedding_manager import MultimodalEmbeddingManager
 from auth_manager import AuthManager
 
@@ -142,92 +143,112 @@ def process_asset_internal(arguments: dict) -> dict:
 
 # --- Dynamic Image Operation Function ---
 def image_operation_internal(arguments: dict, conversation_messages: list = None) -> dict:
-    """Dynamic image generation/editing using OpenAI's Responses API with multiple inputs"""
-    
+    """Dynamic image generation or editing using OpenAI Images API.
+
+    Behavior:
+    - If no image IDs provided: generate a new image from prompt.
+    - If one or more image IDs provided: edit the first matching image using the prompt.
+    The conversation can carry prior images with unique `name` and base64 data which
+    the model can reference via the `images` array in `arguments`.
+    """
+
     try:
         description = arguments.get('description', '')
         style = arguments.get('style', '')
-        image_ids = arguments.get('images', [])
-        
+        image_ids = arguments.get('images', []) or []
+        size = arguments.get('size', '1024x1024')  # optional
+
         if not description:
             return {"success": False, "error": "No description provided for image operation"}
-        
-        # Build the input content for Responses API
-        input_content = []
-        
-        # Add the text prompt
+
         prompt_text = description
         if style:
             prompt_text += f", {style} style"
-        
-        input_content.append({
-            "type": "input_text", 
-            "text": prompt_text
-        })
-        
-        # Add specific images requested by AI
-        image_count = 0
-        if image_ids and conversation_messages:
-            # Create a lookup of all available images
-            available_images = {}
-            
+
+        # Gather available images from prior conversation messages
+        available_images = {}
+        if conversation_messages:
             for msg in conversation_messages:
-                if 'images' in msg:
-                    for img_data in msg['images']:
-                        if img_data.get('base64_data') and img_data.get('name'):
-                            available_images[img_data['name']] = img_data
-            
-            # Add only the images specifically requested by AI
-            for image_id in image_ids:
-                if image_id in available_images:
-                    img_data = available_images[image_id]
-                    image_url = f"data:{img_data['mime_type']};base64,{img_data['base64_data']}"
-                    input_content.append({
-                        "type": "input_image",
-                        "image_url": image_url
-                    })
-                    image_count += 1
-                    print(f"IMAGE_OP: Added requested image '{image_id}' as input")
+                if isinstance(msg, dict) and 'images' in msg:
+                    for img in msg['images']:
+                        if img.get('base64_data') and img.get('name'):
+                            available_images[img['name']] = img
+
+        selected_images = []
+        for img_id in image_ids:
+            if img_id in available_images:
+                selected_images.append(available_images[img_id])
+                print(f"IMAGE_OP: Selected input image '{img_id}'")
+            else:
+                print(f"IMAGE_OP: Warning - requested image '{img_id}' not found in conversation context")
+
+        # If no images selected, do text-to-image generation
+        if not selected_images:
+            print("IMAGE_OP: Generating new image from prompt using Images API")
+            gen = client.images.generate(model="gpt-image-1", prompt=prompt_text, size=size)
+            if not gen.data or not getattr(gen.data[0], 'b64_json', None):
+                return {"success": False, "error": "Image generation returned no data"}
+
+            image_base64 = gen.data[0].b64_json
+            return {
+                "success": True,
+                "image_data": image_base64,
+                "prompt": description,
+                "style": style,
+                "format": "png",
+                "input_images": 0,
+                "requested_images": len(image_ids)
+            }
+
+        # If images provided, do an edit on the first one
+        print("IMAGE_OP: Performing edit on provided image using Images API")
+        first_img = selected_images[0]
+        try:
+            img_bytes = base64.b64decode(first_img['base64_data'])
+        except Exception as decode_err:
+            return {"success": False, "error": f"Failed to decode input image '{first_img.get('name','unknown')}': {decode_err}"}
+
+        # Re-encode to PNG to ensure a valid image mimetype and structure
+        try:
+            pil_image = Image.open(io.BytesIO(img_bytes))
+        except Exception as pil_err:
+            return {"success": False, "error": f"Failed to load input image: {pil_err}"}
+
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                temp_path = tmp.name
+                pil_image.save(tmp, format="PNG")
+
+            with open(temp_path, "rb") as img_fh:
+                # Prefer images.edits if available in SDK; otherwise fall back to images.edit
+                images_api = getattr(client, 'images')
+                if hasattr(images_api, 'edits'):
+                    edit = images_api.edits(model="gpt-image-1", image=img_fh, prompt=prompt_text, size=size)
                 else:
-                    print(f"IMAGE_OP: Warning - requested image '{image_id}' not found")
-        
-        print(f"IMAGE_OP: Using Responses API with {image_count} input images (AI requested {len(image_ids)})")
-        
-        # Use OpenAI Responses API for dynamic image generation/editing
-        response = client.responses.create(
-            model="gpt-4.1",
-            input=[{
-                "role": "user",
-                "content": input_content
-            }],
-            tools=[{"type": "image_generation", "input_fidelity": "high"}]
-        )
-        
-        # Extract the generated image
-        image_data = [
-            output.result
-            for output in response.output
-            if output.type == "image_generation_call"
-        ]
-        
-        if not image_data:
-            return {"success": False, "error": "No image was generated"}
-        
-        # Get the base64 image data
-        image_base64 = image_data[0]
-        
-        print(f"IMAGE_OP: Successfully generated/edited image ({len(image_base64)} chars base64)")
-        
+                    # Older SDKs
+                    edit = images_api.edit(model="gpt-image-1", image=img_fh, prompt=prompt_text, size=size)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+
+        if not edit.data or not getattr(edit.data[0], 'b64_json', None):
+            return {"success": False, "error": "Image edit returned no data"}
+
+        image_base64 = edit.data[0].b64_json
         return {
             "success": True,
             "image_data": image_base64,
-            "description": description,
+            "prompt": description,
             "style": style,
             "format": "png",
-            "input_images": image_count,
+            "input_images": 1,
             "requested_images": len(image_ids)
         }
-        
+
     except Exception as e:
         print(f"IMAGE_OP ERROR: {str(e)}")
         return {"success": False, "error": f"Image operation failed: {str(e)}"}
