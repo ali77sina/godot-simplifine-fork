@@ -204,7 +204,7 @@ private:
 	Vector<AttachedFile> current_attached_files;
 	String conversations_file_path;
 	String api_key;
-	String api_endpoint = "http://localhost:8000/chat";
+    String api_endpoint = "https://gamechat.simplifine.com/chat";
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;

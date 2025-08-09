@@ -35,6 +35,7 @@
 #include "core/os/time.h"
 #include "core/io/file_access.h"
 #include "core/io/resource_loader.h"
+#include "core/io/dir_access.h"
 #include "core/io/image.h"
 #include "core/string/ustring.h"
 #include "core/io/marshalls.h"
@@ -42,6 +43,7 @@
 #include "core/config/project_settings.h"
 #include "scene/resources/image_texture.h"
 #include "editor/editor_node.h"
+#include "editor/file_system/editor_paths.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_string_names.h"
 #include "editor/settings/editor_settings.h"
@@ -411,14 +413,47 @@ void AIChatDock::_notification(int p_notification) {
 				}
 			}
 
-			// Initialize conversation system after UI is ready
-			conversations_file_path = OS::get_singleton()->get_user_data_dir().path_join("ai_chat_conversations.simplifine");
-			_load_conversations();
+            // Initialize conversation system after UI is ready
+            // Prefer storing in project settings dir to avoid per-app-name drift and ensure portability with the project
+            if (EditorPaths::get_singleton() && EditorPaths::get_singleton()->are_paths_valid()) {
+                String new_path = EditorPaths::get_singleton()->get_project_settings_dir().path_join("ai_chat_conversations.simplifine");
+                // Migrate from legacy location if needed
+                String legacy_path = OS::get_singleton()->get_user_data_dir().path_join("ai_chat_conversations.simplifine");
+                if (FileAccess::exists(legacy_path) && !FileAccess::exists(new_path)) {
+                    Ref<DirAccess> da = DirAccess::create_for_path(new_path.get_base_dir());
+                    if (da.is_valid() && !da->dir_exists(new_path.get_base_dir())) {
+                        da->make_dir_recursive(new_path.get_base_dir());
+                    }
+                    Error copy_err;
+                    PackedByteArray bytes = FileAccess::get_file_as_bytes(legacy_path, &copy_err);
+                    if (copy_err == OK) {
+                        Error write_err;
+                        Ref<FileAccess> out = FileAccess::open(new_path, FileAccess::WRITE, &write_err);
+                        if (write_err == OK) {
+                            out->store_buffer(bytes);
+                            out->close();
+                            // Optionally delete legacy file
+                            Ref<DirAccess> da_old = DirAccess::open(legacy_path.get_base_dir());
+                            if (da_old.is_valid()) {
+                                da_old->remove(legacy_path.get_file());
+                            }
+                        }
+                    }
+                }
+                conversations_file_path = new_path;
+            } else {
+                conversations_file_path = OS::get_singleton()->get_user_data_dir().path_join("ai_chat_conversations.simplifine");
+            }
+            _load_conversations();
 			
 			// Create first conversation if none exist
-			if (conversations.is_empty()) {
-				_create_new_conversation();
-			} else {
+            if (conversations.is_empty()) {
+                _create_new_conversation();
+                _update_conversation_dropdown();
+                // Ensure first auto-created conversation is persisted
+				_queue_delayed_save();
+				_execute_delayed_save(); // start background save immediately
+            } else {
 				// Switch to the most recent conversation
 				_switch_to_conversation(conversations.size() - 1);
 			}
@@ -455,7 +490,7 @@ void AIChatDock::_notification(int p_notification) {
 						print_line("AI Chat: Stream completed successfully, server closed connection");
 					} else {
 						print_line("AI Chat: HTTP connection failed with status: " + String::num_int64(client_status));
-						_add_message_to_chat("system", "Connection lost or failed (Status: " + String::num_int64(client_status) + ")");
+						_add_message_to_chat("system", "Connection lost or failed (Status: " + String::num_int64(client_status) + ") - Try again please.");
 					}
 					
 					is_waiting_for_response = false;
@@ -481,10 +516,24 @@ void AIChatDock::_notification(int p_notification) {
 				api_key = EditorSettings::get_singleton()->get_setting("ai_chat/api_key");
 			}
 		} break;
-		case NOTIFICATION_READY: {
+			case NOTIFICATION_READY: {
 			// Auto-verify saved authentication when everything is fully ready
 			_auto_verify_saved_credentials();
 		} break;
+			case NOTIFICATION_EXIT_TREE: {
+				// Final flush save to ensure no data loss on exit
+				if (save_timer) {
+					save_timer->stop();
+				}
+				if (save_thread_busy && save_thread) {
+					save_thread->wait_to_finish();
+					memdelete(save_thread);
+					save_thread = nullptr;
+					save_thread_busy = false;
+				}
+				// Always perform a final synchronous save
+				_save_conversations();
+			} break;
 		case NOTIFICATION_THEME_CHANGED: {
 			// Theme updates handled automatically
 		} break;
@@ -797,320 +846,7 @@ void AIChatDock::_on_edit_message_cancel_pressed(int p_message_index) {
 	call_deferred("_scroll_to_bottom");
 }
 
-// Embedding System Implementation
-
-void AIChatDock::_initialize_embedding_system() {
-	if (embedding_system_initialized) {
-		return;
-	}
-	
-	// Require user authentication for embedding system
-	if (!_is_user_authenticated()) {
-		print_line("AI Chat: Cannot initialize embedding system - user not authenticated");
-		return;
-	}
-	
-	print_line("AI Chat: Initializing embedding system for user: " + current_user_name);
-	
-	// Reset indexing flag to ensure fresh indexing for this user/session
-	initial_indexing_done = false;
-	
-	// Create HTTP request for embedding API calls
-	if (!embedding_request) {
-		embedding_request = memnew(HTTPRequest);
-		add_child(embedding_request);
-		embedding_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_embedding_request_completed));
-	}
-	
-	// Connect to file system signals
-	EditorFileSystem *filesystem = EditorFileSystem::get_singleton();
-	if (filesystem) {
-		if (!filesystem->is_connected("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed))) {
-			filesystem->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
-		}
-		if (!filesystem->is_connected("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed))) {
-			filesystem->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
-		}
-	}
-	
-	embedding_system_initialized = true;
-	
-	// Start initial project indexing (always happens since we reset the flag above)
-	call_deferred("_perform_initial_indexing");
-}
-
-void AIChatDock::_perform_initial_indexing() {
-	print_line("AI Chat: 🔄 Starting comprehensive project indexing for enhanced AI assistance...");
-	print_line("AI Chat: This may take a moment depending on project size");
-	
-	Dictionary data;
-	data["action"] = "index_project";
-	data["project_root"] = _get_project_root_path();
-	data["force_reindex"] = true;  // Force complete reindex on login for fresh start
-	
-	_send_embedding_request("index_project", data);
-}
-
-void AIChatDock::_on_filesystem_changed() {
-	if (!embedding_system_initialized) {
-		return;
-	}
-	
-	print_line("AI Chat: Filesystem changed, updating embeddings");
-	
-	// Get project summary to see what changed
-	Dictionary data;
-	data["action"] = "status";
-	data["project_root"] = _get_project_root_path();
-	
-	_send_embedding_request("status", data);
-}
-
-void AIChatDock::_on_sources_changed(bool p_exist) {
-	if (!embedding_system_initialized || !p_exist) {
-		return;
-	}
-	
-	print_line("AI Chat: Sources changed, performing incremental update");
-	
-	// For now, do a light reindex
-	Dictionary data;
-	data["action"] = "index_project";
-	data["project_root"] = _get_project_root_path();
-	data["force_reindex"] = false;
-	
-	_send_embedding_request("index_project", data);
-}
-
-void AIChatDock::_update_file_embedding(const String &p_file_path) {
-	if (!embedding_system_initialized || !_should_index_file(p_file_path)) {
-		return;
-	}
-	
-	print_line("AI Chat: Updating embedding for file: " + p_file_path);
-	
-	Dictionary data;
-	data["action"] = "update_file";
-	data["project_root"] = _get_project_root_path();
-	data["file_path"] = p_file_path;
-	
-	_send_embedding_request("update_file", data);
-}
-
-void AIChatDock::_remove_file_embedding(const String &p_file_path) {
-	if (!embedding_system_initialized) {
-		return;
-	}
-	
-	print_line("AI Chat: Removing embedding for file: " + p_file_path);
-	
-	Dictionary data;
-	data["action"] = "remove_file";
-	data["project_root"] = _get_project_root_path();
-	data["file_path"] = p_file_path;
-	
-	_send_embedding_request("remove_file", data);
-}
-
-void AIChatDock::_send_embedding_request(const String &p_action, const Dictionary &p_data) {
-	if (!embedding_request) {
-		print_line("AI Chat: Embedding request not initialized");
-		return;
-	}
-	
-	if (!_is_user_authenticated()) {
-		print_line("AI Chat: Cannot send embedding request - user not authenticated");
-		return;
-	}
-	
-	// Prepare request with user authentication
-	String base_url = api_endpoint.replace("/chat", "/embed");
-	
-	// Add user authentication to request data
-	Dictionary auth_data = p_data.duplicate();
-	auth_data["user_id"] = current_user_id;
-	auth_data["machine_id"] = OS::get_singleton()->get_unique_id();
-	
-	String json_data = JSON::stringify(auth_data);
-	
-	PackedStringArray headers;
-	headers.push_back("Content-Type: application/json");
-	if (!auth_token.is_empty()) {
-		headers.push_back("Authorization: Bearer " + auth_token);
-	}
-	if (!api_key.is_empty()) {
-		headers.push_back("X-API-Key: " + api_key);
-	}
-	
-	Error err = embedding_request->request(base_url, headers, HTTPClient::METHOD_POST, json_data);
-	if (err != OK) {
-		print_line("AI Chat: Failed to send embedding request: " + String::num_int64(err));
-	}
-}
-
-void AIChatDock::_on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
-	String response_text = String::utf8((const char *)p_body.ptr(), p_body.size());
-	
-	if (p_code != 200) {
-		print_line("AI Chat: Embedding request failed with code " + String::num_int64(p_code) + ": " + response_text);
-		return;
-	}
-	
-	JSON json;
-	Error parse_err = json.parse(response_text);
-	if (parse_err != OK) {
-		print_line("AI Chat: Failed to parse embedding response: " + response_text);
-		return;
-	}
-	
-	Dictionary response = json.get_data();
-	bool success = response.get("success", false);
-	String action = response.get("action", "");
-	
-	if (!success) {
-		print_line("AI Chat: Embedding operation failed: " + String(response.get("error", "Unknown error")));
-		return;
-	}
-	
-	print_line("AI Chat: Embedding operation '" + action + "' completed successfully");
-	
-	if (action == "index_project") {
-		Dictionary stats = response.get("stats", Dictionary());
-		int indexed = stats.get("indexed", 0);
-		int skipped = stats.get("skipped", 0);
-		int errors = stats.get("errors", 0);
-		
-		print_line("AI Chat: Project indexing completed - Indexed: " + String::num_int64(indexed) + 
-				   ", Skipped: " + String::num_int64(skipped) + 
-				   (errors > 0 ? ", Errors: " + String::num_int64(errors) : ""));
-		
-		if (!initial_indexing_done) {
-			initial_indexing_done = true;
-			print_line("AI Chat: ✅ Project is now fully indexed and ready for AI assistance!");
-		} else {
-			print_line("AI Chat: ✅ Project index updated successfully");
-		}
-	} else if (action == "search") {
-		// Handle multimodal search results for relevant file suggestions
-		Array results = response.get("results", Array());
-		if (results.size() > 0) {
-			print_line("AI Chat: Found " + String::num_int64(results.size()) + " relevant files");
-			
-			// Auto-attach highly relevant files (similarity > 0.7)
-			for (int i = 0; i < results.size(); i++) {
-				Dictionary result = results[i];
-				String file_path = result.get("file_path", "");
-				float similarity = result.get("similarity", 0.0f);
-				String modality = result.get("modality", "text");
-				
-				if (similarity > 0.7 && !file_path.is_empty()) {
-					// Check if file is not already attached
-					bool already_attached = false;
-					for (const AttachedFile &existing_file : current_attached_files) {
-						if (existing_file.path == file_path) {
-							already_attached = true;
-							break;
-						}
-					}
-					
-					if (!already_attached) {
-						print_line("AI Chat: Auto-attaching relevant " + modality + " file: " + file_path + " (similarity: " + String::num(similarity) + ")");
-						Vector<String> files_to_attach;
-						files_to_attach.push_back(file_path);
-						_on_files_selected(files_to_attach);
-					}
-				}
-			}
-		}
-	} else if (action == "status") {
-		// Handle status response from filesystem changes
-		Dictionary stats = response.get("stats", Dictionary());
-		int total_files = stats.get("total_files", 0);
-		int indexed_files = stats.get("indexed_files", 0);
-		
-		print_line("AI Chat: Status check - " + String::num_int64(indexed_files) + "/" + String::num_int64(total_files) + " files indexed");
-		
-		// Check if we need to re-index (files may have changed)
-		// For now, always do an incremental re-index on filesystem changes
-		Dictionary reindex_data;
-		reindex_data["action"] = "index_project";
-		reindex_data["project_root"] = _get_project_root_path();
-		reindex_data["force_reindex"] = false; // Incremental update
-		
-		print_line("AI Chat: Triggering incremental re-index due to filesystem changes");
-		_send_embedding_request("index_project", reindex_data);
-	}
-}
-
-bool AIChatDock::_should_index_file(const String &p_file_path) {
-	// Check file extension for multimodal support
-	String ext = p_file_path.get_extension().to_lower();
-	static const HashSet<String> indexable_extensions = {
-		// Text files
-		"gd", "cs", "js",                    // Scripts
-		"tscn", "scn",                      // Scenes
-		"tres", "res",                      // Resources
-		"json", "cfg",                      // Config files
-		"md", "txt",                        // Documentation
-		"glsl", "shader",                   // Shaders
-		
-		// Image files
-		"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tga", "exr",
-		
-		// Audio files
-		"wav", "ogg", "mp3", "aac", "flac",
-		
-		// 3D models
-		"obj", "fbx", "gltf", "glb"
-	};
-	
-	if (!indexable_extensions.has(ext)) {
-		return false;
-	}
-	
-	// Skip hidden files and temp directories
-	if (p_file_path.find("/.") != -1 || 
-		p_file_path.find("/.godot/") != -1 || 
-		p_file_path.find("/build/") != -1 || 
-		p_file_path.find("/temp/") != -1) {
-		return false;
-	}
-	
-	return true;
-}
-
-String AIChatDock::_get_project_root_path() {
-	return ProjectSettings::get_singleton()->get_resource_path();
-}
-
-void AIChatDock::_suggest_relevant_files(const String &p_query) {
-	if (!embedding_system_initialized || p_query.is_empty()) {
-		return;
-	}
-	
-	print_line("AI Chat: Searching for files relevant to: " + p_query);
-	
-	Dictionary data;
-	data["action"] = "search";
-	data["project_root"] = _get_project_root_path();
-	data["query"] = p_query;
-	data["k"] = 5; // Get top 5 results
-	
-	_send_embedding_request("search", data);
-}
-
-void AIChatDock::_auto_attach_relevant_context() {
-	// Get the current message text
-	String message_text = input_field->get_text().strip_edges();
-	if (message_text.is_empty()) {
-		return;
-	}
-	
-	// Auto-suggest relevant files if the message is substantial
-	if (message_text.length() > 20) {
-		_suggest_relevant_files(message_text);
-	}
-}
+// Embedding system code moved to ai_chat_dock_embeddings.cpp
 
 // Authentication Implementation
 
@@ -1405,15 +1141,49 @@ void AIChatDock::_save_conversations_async() {
 
 void AIChatDock::_save_conversations_to_disk(const String &p_json_data) {
 	// This runs in the next frame, preventing blocking of current frame
-	Error err;
-	Ref<FileAccess> file = FileAccess::open(conversations_file_path, FileAccess::WRITE, &err);
-	if (err != OK) {
-		print_line("AI Chat: Failed to save conversations file: " + String::num_int64(err));
-		return;
-	}
-	
-	file->store_string(p_json_data);
-	file->close();
+    Error err;
+    // Safe write via temp + rename to avoid corruption
+    String final_path = conversations_file_path;
+    String base_dir = final_path.get_base_dir();
+    String final_name = final_path.get_file();
+    String temp_name = final_name + ".tmp";
+    String temp_path = base_dir.path_join(temp_name);
+
+    // Ensure destination directory exists
+    {
+        Ref<DirAccess> da_mk = DirAccess::create_for_path(base_dir);
+        if (da_mk.is_valid() && !da_mk->dir_exists(base_dir)) {
+            da_mk->make_dir_recursive(base_dir);
+        }
+    }
+    // Write to temp
+    {
+        Ref<FileAccess> tmp = FileAccess::open(temp_path, FileAccess::WRITE, &err);
+        if (err != OK) {
+            print_line("AI Chat: Failed to open temp file for save: " + String::num_int64(err));
+            return;
+        }
+        tmp->store_string(p_json_data);
+        tmp->close();
+    }
+
+    // Rename temp to final
+    Ref<DirAccess> da = DirAccess::open(base_dir);
+    if (da.is_valid()) {
+        if (da->file_exists(final_name)) {
+            da->remove(final_name);
+        }
+        da->rename(temp_name, final_name);
+    } else {
+        // Fallback: write directly if Directory open failed
+        Ref<FileAccess> file = FileAccess::open(final_path, FileAccess::WRITE, &err);
+        if (err != OK) {
+            print_line("AI Chat: Failed to save conversations file: " + String::num_int64(err));
+            return;
+        }
+        file->store_string(p_json_data);
+        file->close();
+    }
 	// print_line("AI Chat: Conversations saved successfully");
 }
 
@@ -1427,7 +1197,7 @@ void AIChatDock::_save_conversations_chunked(int p_start_index) {
 		_chunked_conversations_array.clear();
 	}
 	
-	// Process this chunk
+    // Process this chunk
 	for (int i = p_start_index; i < end_index; i++) {
 		const AIChatDock::Conversation &conv = conversations[i];
 		Dictionary conv_dict;
@@ -1437,9 +1207,52 @@ void AIChatDock::_save_conversations_chunked(int p_start_index) {
 		conv_dict["last_modified_timestamp"] = conv.last_modified_timestamp;
 		
 		Array messages_array;
-		for (int j = 0; j < conv.messages.size(); j++) {
-			messages_array.push_back(_build_api_message(conv.messages[j]));
-		}
+        for (int j = 0; j < conv.messages.size(); j++) {
+            const ChatMessage &msg = conv.messages[j];
+            Dictionary msg_dict;
+            msg_dict["role"] = msg.role;
+            msg_dict["content"] = msg.content;
+            msg_dict["timestamp"] = msg.timestamp;
+            msg_dict["tool_calls"] = msg.tool_calls;
+            msg_dict["tool_call_id"] = msg.tool_call_id;
+            msg_dict["name"] = msg.name;
+            msg_dict["tool_results"] = msg.tool_results;
+
+            // Attached files
+            Array attached_files_array;
+            for (int k = 0; k < msg.attached_files.size(); k++) {
+                const AttachedFile &file = msg.attached_files[k];
+                Dictionary file_dict;
+                file_dict["path"] = file.path;
+                file_dict["name"] = file.name;
+                file_dict["content"] = file.content;
+                file_dict["is_image"] = file.is_image;
+                file_dict["mime_type"] = file.mime_type;
+                file_dict["base64_data"] = file.base64_data;
+                // v2 array sizes
+                Array os;
+                os.push_back(file.original_size.x);
+                os.push_back(file.original_size.y);
+                file_dict["original_size"] = os;
+                Array ds;
+                ds.push_back(file.display_size.x);
+                ds.push_back(file.display_size.y);
+                file_dict["display_size"] = ds;
+                // v1 compatibility
+                file_dict["original_size_x"] = file.original_size.x;
+                file_dict["original_size_y"] = file.original_size.y;
+                file_dict["display_size_x"] = file.display_size.x;
+                file_dict["display_size_y"] = file.display_size.y;
+                file_dict["was_downsampled"] = file.was_downsampled;
+                file_dict["is_node"] = file.is_node;
+                file_dict["node_path"] = file.node_path;
+                file_dict["node_type"] = file.node_type;
+                attached_files_array.push_back(file_dict);
+            }
+            msg_dict["attached_files"] = attached_files_array;
+
+            messages_array.push_back(msg_dict);
+        }
 		conv_dict["messages"] = messages_array;
 		_chunked_conversations_array.push_back(conv_dict);
 	}
@@ -1457,7 +1270,8 @@ void AIChatDock::_save_conversations_chunked(int p_start_index) {
 }
 
 void AIChatDock::_finalize_conversations_save() {
-	Dictionary data;
+    Dictionary data;
+    data["version"] = 2;
 	data["conversations"] = _chunked_conversations_array;
 	
 	Ref<JSON> json;
@@ -1490,7 +1304,12 @@ void AIChatDock::_execute_delayed_save() {
 	}
 	
 	if (save_thread_busy) {
-		return; // A save is already running
+        // A save is already running. Reschedule shortly to coalesce further changes
+        if (save_timer) {
+            save_timer->stop();
+            save_timer->start(0.5); // retry soon after current save finishes
+        }
+        return;
 	}
 	
 	save_pending = false;
@@ -1524,8 +1343,9 @@ void AIChatDock::_background_save(void *p_data_ptr) {
 	SaveData *save_data = reinterpret_cast<SaveData*>(p_data_ptr);
 	Vector<Conversation> &snapshot = *save_data->snapshot;
 	
-	// Build the data structure (heavy JSON stringify)
-	Dictionary data;
+    // Build the data structure (heavy JSON stringify)
+    Dictionary data;
+    data["version"] = 2; // schema version for future migrations
 	Array conv_array;
 	
 	for (const Conversation &conv : snapshot) {
@@ -1544,9 +1364,9 @@ void AIChatDock::_background_save(void *p_data_ptr) {
 			msg_dict["tool_calls"] = msg.tool_calls;
 			msg_dict["tool_call_id"] = msg.tool_call_id;
 			msg_dict["name"] = msg.name;
-			msg_dict["tool_results"] = msg.tool_results;
+            msg_dict["tool_results"] = msg.tool_results;
 			
-			// Handle attached files
+            // Handle attached files
 			Array files_array;
 			for (const AttachedFile &file : msg.attached_files) {
 				Dictionary file_dict;
@@ -1556,15 +1376,20 @@ void AIChatDock::_background_save(void *p_data_ptr) {
 				file_dict["is_image"] = file.is_image;
 				file_dict["mime_type"] = file.mime_type;
 				file_dict["base64_data"] = file.base64_data;
-				Array original_size_array;
-				original_size_array.push_back(file.original_size.x);
-				original_size_array.push_back(file.original_size.y);
-				file_dict["original_size"] = original_size_array;
-				
-				Array display_size_array;
-				display_size_array.push_back(file.display_size.x);
-				display_size_array.push_back(file.display_size.y);
-				file_dict["display_size"] = display_size_array;
+                // Use array-based sizes for v2, loader supports both v1 (x/y) and v2 (arrays)
+                Array original_size_array;
+                original_size_array.push_back(file.original_size.x);
+                original_size_array.push_back(file.original_size.y);
+                file_dict["original_size"] = original_size_array;
+                Array display_size_array;
+                display_size_array.push_back(file.display_size.x);
+                display_size_array.push_back(file.display_size.y);
+                file_dict["display_size"] = display_size_array;
+                // Also include x/y keys for backward compatibility with older loaders
+                file_dict["original_size_x"] = file.original_size.x;
+                file_dict["original_size_y"] = file.original_size.y;
+                file_dict["display_size_x"] = file.display_size.x;
+                file_dict["display_size_y"] = file.display_size.y;
 				file_dict["was_downsampled"] = file.was_downsampled;
 				file_dict["is_node"] = file.is_node;
 				file_dict["node_path"] = file.node_path;
@@ -1585,13 +1410,47 @@ void AIChatDock::_background_save(void *p_data_ptr) {
 	json.instantiate();
 	String json_string = json->stringify(data, "  ");
 	
-	// File I/O (heavy operation)
-	Error err;
-	Ref<FileAccess> file = FileAccess::open(save_data->file_path, FileAccess::WRITE, &err);
-	if (err == OK) {
-		file->store_string(json_string);
-		file->close();
-	}
+    // File I/O (heavy operation) with safe write via temp + rename
+    Error err;
+    String final_path = save_data->file_path;
+    String base_dir = final_path.get_base_dir();
+    String final_name = final_path.get_file();
+    String temp_name = final_name + ".tmp";
+    String temp_path = base_dir.path_join(temp_name);
+
+    // Ensure destination directory exists
+    {
+        Ref<DirAccess> da_mk = DirAccess::create_for_path(base_dir);
+        if (da_mk.is_valid() && !da_mk->dir_exists(base_dir)) {
+            da_mk->make_dir_recursive(base_dir);
+        }
+    }
+    // Write to temp
+    {
+        Ref<FileAccess> tmp = FileAccess::open(temp_path, FileAccess::WRITE, &err);
+        if (err == OK) {
+            tmp->store_string(json_string);
+            tmp->close();
+        }
+    }
+    if (err == OK) {
+        // Rename temp to final (best-effort atomic within same dir)
+        Ref<DirAccess> da = DirAccess::open(base_dir);
+        if (da.is_valid()) {
+            // Remove existing file if present (rename should overwrite but be safe cross-platform)
+            if (da->file_exists(final_name)) {
+                da->remove(final_name);
+            }
+            da->rename(temp_name, final_name);
+        } else {
+            // Fallback: write directly if Directory open failed
+            Ref<FileAccess> file = FileAccess::open(final_path, FileAccess::WRITE, &err);
+            if (err == OK) {
+                file->store_string(json_string);
+                file->close();
+            }
+        }
+    }
 	
 	// Signal back to main thread
 	AIChatDock *instance = save_data->instance;
@@ -1614,6 +1473,11 @@ void AIChatDock::_on_background_save_finished() {
 	}
 	save_thread_busy = false;
 	print_line("AI Chat: Background save finished");
+    // If changes accumulated during the background save, schedule another save soon
+    if (save_pending && save_timer) {
+        save_timer->stop();
+        save_timer->start(0.25);
+    }
 }
 
 void AIChatDock::_process_image_attachment_async(const String &p_file_path, const String &p_name, const String &p_mime_type) {
@@ -2354,11 +2218,30 @@ void AIChatDock::_process_ndjson_line(const String &p_line) {
 		return;
 	}
 
-	if (data.has("status") && (data["status"] == "finished" || data["status"] == "completed")) {
-		stream_completed_successfully = true;
-		print_line("AI Chat: Server signaled end of stream");
-		return;
-	}
+    if (data.has("status") && (data["status"] == "finished" || data["status"] == "completed")) {
+        stream_completed_successfully = true;
+        print_line("AI Chat: Server signaled end of stream");
+
+        // Finalize UI/state immediately; some proxies keep the TCP open briefly.
+        if (current_conversation_index >= 0) {
+            conversations.write[current_conversation_index].last_modified_timestamp = _get_timestamp();
+            _queue_delayed_save();
+        }
+
+        is_waiting_for_response = false;
+        stop_requested = false;
+        current_request_id = "";
+        _update_ui_state();
+
+        // Ensure the HTTP connection is closed so the poll loop exits promptly.
+        if (http_client.is_valid()) {
+            http_client->close();
+        }
+        http_status = STATUS_DONE;
+        current_assistant_message_label = nullptr;
+        set_process(false);
+        return;
+    }
 
 	// Handle request_id from backend (first message)
 	if (data.has("request_id") && data.has("status") && data["status"] == "started") {
@@ -2441,39 +2324,56 @@ void AIChatDock::_process_ndjson_line(const String &p_line) {
 		return; // Stop further processing for this line
 	}
 	
-	// Handle completed tool execution results
-	if (data.has("status") && data["status"] == "tool_completed") {
-		String tool_executed = data.get("tool_executed", "");
-		Dictionary tool_result = data.get("tool_result", Dictionary());
-		
-		print_line("AI Chat: Tool completed: " + tool_executed + " (success: " + String(tool_result.get("success", false) ? "true" : "false") + ")");
-		
-		// Handle image generation specially (critical functionality)
-		if (tool_executed == "image_operation" && tool_result.get("success", false)) {
-			String image_data = tool_result.get("image_data", "");
-			String prompt = tool_result.get("prompt", "");
-			
-			if (!image_data.is_empty()) {
-				print_line("AI Chat: Displaying generated image for prompt: " + prompt + " (" + String::num(image_data.length()) + " chars base64)");
-				_handle_generated_image(image_data, "generated_" + String::num(OS::get_singleton()->get_ticks_msec()));
-			}
-		} else {
-			// Handle other tools using the standard tool result system
-			String tool_call_id = data.get("tool_call_id", "");
-			if (!tool_call_id.is_empty()) {
-				// Create args dictionary for proper UI recreation
-				Dictionary args;
-				
-				// Use the standard tool result system for consistent UX
-				_add_tool_response_to_chat(tool_call_id, tool_executed, args, tool_result);
-			} else {
-				print_line("AI Chat: Warning - tool_completed missing tool_call_id, cannot update placeholder");
-			}
-		}
+    // Handle completed tool execution results
+    if (data.has("status") && data["status"] == "tool_completed") {
+        String tool_executed = data.get("tool_executed", "");
+        Dictionary tool_result = data.get("tool_result", Dictionary());
+        print_line("AI Chat: Tool completed: " + tool_executed + " (success: " + String(tool_result.get("success", false) ? "true" : "false") + ")");
 
-		
-		return; // Stop further processing for this line
-	}
+        String tool_call_id = data.get("tool_call_id", "");
+
+        // Ensure conversation history contains the required assistant message with tool_calls
+        // so that subsequent API requests won't fail schema validation.
+        if (!tool_call_id.is_empty()) {
+            AIChatDock::ChatMessage assistant_tool_call_msg;
+            assistant_tool_call_msg.role = "assistant";
+            assistant_tool_call_msg.content = String();
+            Array tool_calls_arr;
+            Dictionary tool_call_dict;
+            tool_call_dict["id"] = tool_call_id;
+            tool_call_dict["type"] = "function";
+            Dictionary function_dict;
+            function_dict["name"] = tool_executed;
+            function_dict["arguments"] = "{}"; // Minimal placeholder; backend already executed the real args
+            tool_call_dict["function"] = function_dict;
+            tool_calls_arr.push_back(tool_call_dict);
+            assistant_tool_call_msg.tool_calls = tool_calls_arr;
+            Vector<AIChatDock::ChatMessage> &history = _get_current_chat_history();
+            history.push_back(assistant_tool_call_msg);
+        }
+
+        // Special-case for image results when no tool_call_id is present (backend not providing it)
+        if (tool_executed == "image_operation" && tool_result.get("success", false)) {
+            String image_data = tool_result.get("image_data", "");
+            if (!image_data.is_empty()) {
+                if (tool_call_id.is_empty()) {
+                    // Fallback: render image immediately if we can't update a placeholder
+                    _handle_generated_image(image_data, "generated_" + String::num_int64(OS::get_singleton()->get_ticks_msec()));
+                    return;
+                }
+                // If we have a tool_call_id, fall through to unified UI for consistency
+            }
+        }
+
+        // Unified tool UI handling (updates placeholder and records in history)
+        if (!tool_call_id.is_empty()) {
+            Dictionary args; // Optionally populate with inputs
+            _add_tool_response_to_chat(tool_call_id, tool_executed, args, tool_result);
+        } else {
+            print_line("AI Chat: Warning - tool_completed missing tool_call_id, cannot update placeholder");
+        }
+        return; // Stop further processing for this line
+    }
 
 	// Handle image generation results (legacy - keeping for backward compatibility)
 	if (data.has("status") && data["status"] == "image_generated") {
@@ -2826,13 +2726,32 @@ void AIChatDock::_add_tool_response_to_chat(const String &p_tool_call_id, const 
 	msg.role = "tool";
 	msg.tool_call_id = p_tool_call_id;
 	msg.name = p_name;
-	msg.content = json->stringify(p_result);
+    // Prepare a content payload we can enrich with metadata like image_name
+    Dictionary result_for_content = p_result;
 	msg.timestamp = _get_timestamp();
 	
 	// Store the original tool arguments for proper UI recreation
 	msg.tool_results.clear();
 	msg.tool_results.push_back(p_result);
 	msg.tool_results.push_back(p_args); // Store args as second element
+
+	// If this is an image generation/edit result, attach the image to the message so
+	// subsequent requests can reference it via top-level 'images' (derived at serialization).
+	if (p_name == "image_operation" && p_result.get("success", false) && p_result.has("image_data")) {
+		AIChatDock::AttachedFile gen_file;
+		gen_file.path = "generated://tool_result";
+        gen_file.name = String("generated_") + String::num_int64(OS::get_singleton()->get_ticks_msec());
+		gen_file.content = "";
+		gen_file.is_image = true;
+		gen_file.mime_type = "image/png";
+		gen_file.base64_data = p_result.get("image_data", "");
+		msg.attached_files.push_back(gen_file);
+
+        // Expose the image identifier in the tool message content for the model to reference
+        result_for_content["image_name"] = gen_file.name;
+	}
+
+    msg.content = json->stringify(result_for_content);
 
 	Vector<AIChatDock::ChatMessage> &chat_history = _get_current_chat_history();
 	chat_history.push_back(msg);
@@ -2843,7 +2762,16 @@ void AIChatDock::_add_tool_response_to_chat(const String &p_tool_call_id, const 
 	}
 	PanelContainer *placeholder = Object::cast_to<PanelContainer>(chat_container->find_child("tool_placeholder_" + p_tool_call_id, true, false));
 	if (!placeholder) {
-		return;
+		// Fallback: create a backend tool placeholder on the fly so we can render results
+		print_line("AI Chat: No placeholder for tool_call_id=" + p_tool_call_id + ", creating one on the fly.");
+		_create_backend_tool_placeholder(p_tool_call_id, p_name);
+		placeholder = Object::cast_to<PanelContainer>(chat_container->find_child("tool_placeholder_" + p_tool_call_id, true, false));
+		if (!placeholder) {
+			// As a last resort, directly create a result bubble without placeholder
+			_update_tool_placeholder_with_result(msg);
+			call_deferred("_scroll_to_bottom");
+			return;
+		}
 	}
 
 	// Clear the "loading" text immediately.
@@ -3154,8 +3082,8 @@ void AIChatDock::_create_tool_call_bubbles(const Array &p_tool_calls) {
 		HBoxContainer *tool_hbox = memnew(HBoxContainer);
 		placeholder->add_child(tool_hbox);
 
-		Label *tool_label = memnew(Label);
-		tool_label->set_text("Calling tool: " + func_name + "...");
+        Label *tool_label = memnew(Label);
+        tool_label->set_text("Running tool: " + func_name + "...");
 		tool_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
 		tool_label->add_theme_icon_override("icon", get_theme_icon(SNAME("Tools"), SNAME("EditorIcons")));
 		tool_hbox->add_child(tool_label);
@@ -3205,7 +3133,7 @@ void AIChatDock::_update_tool_placeholder_with_result(const ChatMessage &p_tool_
 	VBoxContainer *tool_container = memnew(VBoxContainer);
 	placeholder->add_child(tool_container);
 
-	Button *toggle_button = memnew(Button);
+    Button *toggle_button = memnew(Button);
 	
 	// Show success/failure status in the button
 	bool success = result.get("success", false);
@@ -3213,27 +3141,40 @@ void AIChatDock::_update_tool_placeholder_with_result(const ChatMessage &p_tool_
 	String status_text = success ? "SUCCESS" : "ERROR";
 	toggle_button->set_text(status_text + " - " + p_tool_message.name + ": " + message);
 	
-	toggle_button->set_flat(false);
+    toggle_button->set_flat(false);
 	toggle_button->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	toggle_button->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
+    toggle_button->set_clip_text(true);
+    toggle_button->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
 	toggle_button->add_theme_icon_override("icon", get_theme_icon(success ? SNAME("StatusSuccess") : SNAME("StatusError"), SNAME("EditorIcons")));
 	toggle_button->add_theme_color_override("font_color", success ? get_theme_color(SNAME("success_color"), SNAME("Editor")) : get_theme_color(SNAME("error_color"), SNAME("Editor")));
 	tool_container->add_child(toggle_button);
 
-	PanelContainer *content_panel = memnew(PanelContainer);
-	content_panel->set_visible(false); // Collapsed by default
-	tool_container->add_child(content_panel);
-	toggle_button->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_output_toggled).bind(content_panel));
+    PanelContainer *content_panel = memnew(PanelContainer);
+    content_panel->set_visible(false); // Collapsed by default (may be opened below conditionally)
+    content_panel->set_clip_contents(true); // Prevent visual overflow
+    tool_container->add_child(content_panel);
+    toggle_button->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_output_toggled).bind(content_panel));
 
-	Ref<StyleBoxFlat> content_style = memnew(StyleBoxFlat);
-	content_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
-	content_style->set_border_width_all(1);
-	content_style->set_border_color(get_theme_color(SNAME("dark_color_2"), SNAME("Editor")));
-	content_style->set_content_margin_all(10);
-	content_panel->add_theme_style_override("panel", content_style);
+    Ref<StyleBoxFlat> content_style = memnew(StyleBoxFlat);
+    content_style->set_bg_color(get_theme_color(SNAME("dark_color_1"), SNAME("Editor")));
+    content_style->set_border_width_all(1);
+    content_style->set_border_color(get_theme_color(SNAME("dark_color_2"), SNAME("Editor")));
+    content_style->set_content_margin_all(6);
+    content_panel->add_theme_style_override("panel", content_style);
 
-	VBoxContainer *content_vbox = memnew(VBoxContainer);
-	content_panel->add_child(content_vbox);
+    // Wrap tool content in a scroll container to avoid growing beyond view
+    ScrollContainer *content_scroll = memnew(ScrollContainer);
+    content_scroll->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    content_scroll->set_v_size_flags(Control::SIZE_FILL);
+    content_scroll->set_custom_minimum_size(Size2(0, 320)); // cap visible height
+    content_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+    content_panel->add_child(content_scroll);
+
+    VBoxContainer *content_vbox = memnew(VBoxContainer);
+    content_vbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    content_vbox->set_v_size_flags(Control::SIZE_SHRINK_BEGIN);
+    content_scroll->add_child(content_vbox);
 
 	HBoxContainer *header_hbox = memnew(HBoxContainer);
 	content_vbox->add_child(header_hbox);
@@ -3252,8 +3193,13 @@ void AIChatDock::_update_tool_placeholder_with_result(const ChatMessage &p_tool_
 		args = p_tool_message.tool_results[1]; // Args are stored as second element
 	}
 
-	// Create specific UI based on the tool that was called
-	_create_tool_specific_ui(content_vbox, p_tool_message.name, result, success, args);
+    // Create specific UI based on the tool that was called
+    _create_tool_specific_ui(content_vbox, p_tool_message.name, result, success, args);
+
+    // Open image tool results by default for better UX
+    if (p_tool_message.name == "image_operation" || (result.get("success", false) && result.has("image_data"))) {
+        content_panel->set_visible(true);
+    }
 }
 
 void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const String &p_tool_name, const Dictionary &p_result, bool p_success, const Dictionary &p_args) {
@@ -3745,7 +3691,7 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 		
 		Label *status_label = memnew(Label);
 		if (errors.size() == 0) {
-			status_label->set_text("✓ No compilation errors found");
+			status_label->set_text("No compilation errors found");
 			status_label->add_theme_color_override("font_color", get_theme_color(SNAME("success_color"), SNAME("Editor")));
 		} else {
 			status_label->set_text("✗ Found " + String::num_int64(errors.size()) + " compilation errors");
@@ -4093,11 +4039,11 @@ void AIChatDock::_send_chat_request() {
 					image_part["image_url"] = image_url;
 					content_array.push_back(image_part);
 					
-					// Add image ID as text so AI knows how to reference it
-					Dictionary text_part;
-					text_part["type"] = "text";
-					text_part["text"] = "\n*[Image ID: " + file.name + "]*";
-					content_array.push_back(text_part);
+            // Add image ID marker; and promote to top-level 'images' for backend tool context
+            Dictionary text_part;
+            text_part["type"] = "text";
+            text_part["text"] = "\n*[Image ID: " + file.name + "]*";
+            content_array.push_back(text_part);
 				} else {
 					// Add text files as text content
 					Dictionary text_part;
@@ -4147,21 +4093,22 @@ void AIChatDock::_send_chat_request() {
 					
 					api_msg["content"] = content_with_images;
 					
-					// Also store image data in a custom field for the backend to understand
-					Array images_data;
-					for (const AttachedFile &file : msg.attached_files) {
-						if (file.is_image) {
-							Dictionary image_info;
-							image_info["name"] = file.name;
-							image_info["mime_type"] = file.mime_type;
-							image_info["base64_data"] = file.base64_data;
-							image_info["original_size"] = Vector2(file.original_size.x, file.original_size.y);
-							images_data.push_back(image_info);
-						}
-					}
-					if (!images_data.is_empty()) {
-						api_msg["images"] = images_data;
-					}
+                    // Include generated image data for backend-only image editing context.
+                    // This is NOT sent to OpenAI by the backend; it's only used by /chat tool execution.
+                    Array images_data;
+                    for (const AttachedFile &file : msg.attached_files) {
+                        if (file.is_image) {
+                            Dictionary image_info;
+                            image_info["name"] = file.name;
+                            image_info["mime_type"] = file.mime_type;
+                            image_info["base64_data"] = file.base64_data;
+                            image_info["original_size"] = Vector2(file.original_size.x, file.original_size.y);
+                            images_data.push_back(image_info);
+                        }
+                    }
+                    if (!images_data.is_empty()) {
+                        api_msg["images"] = images_data;
+                    }
 				} else {
 					api_msg["content"] = msg.content;
 				}
@@ -4170,13 +4117,48 @@ void AIChatDock::_send_chat_request() {
 			}
 		}
 		
-		if (msg.role == "assistant" && !msg.tool_calls.is_empty()) {
+        if (msg.role == "assistant" && !msg.tool_calls.is_empty()) {
 			api_msg["tool_calls"] = msg.tool_calls;
 		}
-		if (msg.role == "tool") {
-			api_msg["tool_call_id"] = msg.tool_call_id;
-			api_msg["name"] = msg.name;
-		}
+        if (msg.role == "tool") {
+            api_msg["tool_call_id"] = msg.tool_call_id;
+            api_msg["name"] = msg.name;
+            // Only strip image_data for image_operation; keep full content for other tools
+            if (msg.name == "image_operation") {
+                Dictionary raw;
+                if (!msg.tool_results.is_empty()) {
+                    raw = msg.tool_results[0];
+                } else {
+                    Ref<JSON> json_tool;
+                    json_tool.instantiate();
+                    if (json_tool->parse(msg.content) == OK) {
+                        raw = json_tool->get_data();
+                    }
+                }
+                // Promote assistant images to top-level 'images' so backend edits can find them
+                Array images_data;
+                for (const AttachedFile &file : msg.attached_files) {
+                    if (file.is_image) {
+                        Dictionary image_info;
+                        image_info["name"] = file.name;
+                        image_info["mime_type"] = file.mime_type;
+                        image_info["base64_data"] = file.base64_data;
+                        image_info["original_size"] = Vector2(file.original_size.x, file.original_size.y);
+                        images_data.push_back(image_info);
+                    }
+                }
+                if (!images_data.is_empty()) {
+                    api_msg["images"] = images_data;
+                }
+                raw.erase("image_data");
+                Ref<JSON> json_min;
+                json_min.instantiate();
+                api_msg["content"] = json_min->stringify(raw);
+            } else {
+                // Non-image tools: pass original content
+                api_msg["content"] = msg.content;
+            }
+        }
 		messages.push_back(api_msg);
 	}
 
@@ -4309,21 +4291,21 @@ Dictionary AIChatDock::_build_api_message(const ChatMessage &p_msg) {
 				
 				api_msg["content"] = content_with_images;
 				
-				// Also store image data in a custom field for the backend to understand
-				Array images_data;
-				for (const AttachedFile &file : p_msg.attached_files) {
-					if (file.is_image) {
-						Dictionary image_info;
-						image_info["name"] = file.name;
-						image_info["mime_type"] = file.mime_type;
-						image_info["base64_data"] = file.base64_data;
-						image_info["original_size"] = Vector2(file.original_size.x, file.original_size.y);
-						images_data.push_back(image_info);
-					}
-				}
-				if (!images_data.is_empty()) {
-					api_msg["images"] = images_data;
-				}
+                // For assistant messages with images, include 'images' array so backend image editing has context
+                Array images_data;
+                for (const AttachedFile &file : p_msg.attached_files) {
+                    if (file.is_image) {
+                        Dictionary image_info;
+                        image_info["name"] = file.name;
+                        image_info["mime_type"] = file.mime_type;
+                        image_info["base64_data"] = file.base64_data;
+                        image_info["original_size"] = Vector2(file.original_size.x, file.original_size.y);
+                        images_data.push_back(image_info);
+                    }
+                }
+                if (!images_data.is_empty()) {
+                    api_msg["images"] = images_data;
+                }
 			} else {
 				api_msg["content"] = p_msg.content;
 			}
@@ -4333,7 +4315,7 @@ Dictionary AIChatDock::_build_api_message(const ChatMessage &p_msg) {
 	}
 	
 	// Save attached files for ALL message types (user, assistant, etc.)
-	if (!p_msg.attached_files.is_empty()) {
+    if (!p_msg.attached_files.is_empty()) {
 		Array attached_files_array;
 		for (const AttachedFile &file : p_msg.attached_files) {
 			Dictionary file_dict;
@@ -4342,7 +4324,10 @@ Dictionary AIChatDock::_build_api_message(const ChatMessage &p_msg) {
 			file_dict["content"] = file.content;
 			file_dict["is_image"] = file.is_image;
 			file_dict["mime_type"] = file.mime_type;
-			file_dict["base64_data"] = file.base64_data;
+            // Only include raw base64 for user attachments (inputs), never for assistant/tool outputs
+            if (p_msg.role == "user") {
+                file_dict["base64_data"] = file.base64_data;
+            }
 			file_dict["original_size_x"] = file.original_size.x;
 			file_dict["original_size_y"] = file.original_size.y;
 			file_dict["display_size_x"] = file.display_size.x;
@@ -4360,6 +4345,18 @@ Dictionary AIChatDock::_build_api_message(const ChatMessage &p_msg) {
 	if (p_msg.role == "tool") {
 		api_msg["tool_call_id"] = p_msg.tool_call_id;
 		api_msg["name"] = p_msg.name;
+        if (p_msg.name == "image_operation") {
+            Dictionary raw;
+            if (!p_msg.tool_results.is_empty()) {
+                raw = p_msg.tool_results[0];
+            }
+			raw.erase("image_data");
+			Ref<JSON> json_min;
+			json_min.instantiate();
+			api_msg["content"] = json_min->stringify(raw);
+		} else {
+			api_msg["content"] = p_msg.content;
+		}
 	}
 	
 	// Save tool results
@@ -4423,9 +4420,14 @@ void AIChatDock::_finalize_chat_request() {
 		host = host.substr(0, host.find(":"));
 	}
 
-	PackedByteArray request_body_data = request_body.to_utf8_buffer();
-	print_line("AI Chat: Attempting to connect to " + host + ":" + String::num_int64(port) + path);
-	Error err = http_client->connect_to_host(host, port, (use_ssl ? TLSOptions::client_unsafe(Ref<X509Certificate>()) : Ref<TLSOptions>()));
+    PackedByteArray request_body_data = request_body.to_utf8_buffer();
+    print_line("AI Chat: Attempting to connect to " + host + ":" + String::num_int64(port) + path);
+    Ref<TLSOptions> tls_options;
+    if (use_ssl) {
+        // Use default platform CA and standard hostname verification.
+        tls_options = TLSOptions::client();
+    }
+    Error err = http_client->connect_to_host(host, port, tls_options);
 	if (err != OK) {
 		_add_message_to_chat("system", "Failed to connect to backend: " + host + ":" + String::num_int64(port) + " (Error: " + String::num_int64(err) + ")");
 		is_waiting_for_response = false;
@@ -4700,6 +4702,27 @@ void AIChatDock::_save_layout_to_config(Ref<ConfigFile> p_layout, const String &
 void AIChatDock::_load_layout_from_config(Ref<ConfigFile> p_layout, const String &p_section) {
 	if (p_layout->has_section_key(p_section, "api_endpoint")) {
 		api_endpoint = p_layout->get_value(p_section, "api_endpoint");
+		// Normalize and migrate endpoint to cloud if it was pointing to localhost.
+		String endpoint = api_endpoint.strip_edges();
+		if (endpoint.is_empty()) {
+			api_endpoint = "https://gamechat.simplifine.com/chat";
+		} else {
+			String lower = endpoint.to_lower();
+			bool was_local = lower.find("localhost") != -1 || lower.find("127.0.0.1") != -1;
+			if (was_local) {
+				api_endpoint = "https://gamechat.simplifine.com/chat";
+			} else {
+				// Ensure scheme.
+				if (!endpoint.begins_with("http://") && !endpoint.begins_with("https://")) {
+					endpoint = "https://" + endpoint;
+				}
+				// Ensure it contains /chat so other routes (auth/embed/stop) can be derived via replace.
+				if (endpoint.find("/chat") == -1) {
+					endpoint = endpoint.ends_with("/") ? endpoint + "chat" : endpoint + "/chat";
+				}
+				api_endpoint = endpoint;
+			}
+		}
 	}
 	if (p_layout->has_section_key(p_section, "model")) {
 		model = p_layout->get_value(p_section, "model");
@@ -4708,146 +4731,257 @@ void AIChatDock::_load_layout_from_config(Ref<ConfigFile> p_layout, const String
 
 // Conversation management methods
 void AIChatDock::_load_conversations() {
-	if (!FileAccess::exists(conversations_file_path)) {
-		return;
-	}
-	
-	Error err;
-	String file_content = FileAccess::get_file_as_string(conversations_file_path, &err);
-	if (err != OK) {
-		print_line("AI Chat: Failed to load conversations file");
-		return;
-	}
-	
-	Ref<JSON> json;
-	json.instantiate();
-	err = json->parse(file_content);
-	if (err != OK) {
-		print_line("AI Chat: Failed to parse conversations file");
-		return;
-	}
-	
-	Dictionary data = json->get_data();
-	if (!data.has("conversations")) {
-		return;
-	}
-	
-	Array conversations_array = data["conversations"];
-	conversations.clear();
-	
-	for (int i = 0; i < conversations_array.size(); i++) {
-		Dictionary conv_dict = conversations_array[i];
-		AIChatDock::Conversation conv;
-		conv.id = conv_dict.get("id", "");
-		conv.title = conv_dict.get("title", "");
-		conv.created_timestamp = conv_dict.get("created_timestamp", "");
-		conv.last_modified_timestamp = conv_dict.get("last_modified_timestamp", "");
-		
-		Array messages_array = conv_dict.get("messages", Array());
-		for (int j = 0; j < messages_array.size(); j++) {
-			Dictionary msg_dict = messages_array[j];
-			AIChatDock::ChatMessage msg;
-			msg.role = msg_dict.get("role", "");
-			msg.content = msg_dict.get("content", "");
-			msg.timestamp = msg_dict.get("timestamp", "");
-			msg.tool_calls = msg_dict.get("tool_calls", Array());
-			msg.tool_call_id = msg_dict.get("tool_call_id", "");
-			msg.name = msg_dict.get("name", "");
-			
-			// Load attached files (skip heavy base64 data during initial load for performance)
-			Array attached_files_array = msg_dict.get("attached_files", Array());
-			for (int k = 0; k < attached_files_array.size(); k++) {
-				Dictionary file_dict = attached_files_array[k];
-				AIChatDock::AttachedFile file;
-				file.path = file_dict.get("path", "");
-				file.name = file_dict.get("name", "");
-				file.content = file_dict.get("content", "");
-				file.is_image = file_dict.get("is_image", false);
-				file.mime_type = file_dict.get("mime_type", "");
-				// Load base64_data only when conversation is being displayed
-				file.base64_data = file_dict.get("base64_data", "");
-				file.original_size.x = file_dict.get("original_size_x", 0);
-				file.original_size.y = file_dict.get("original_size_y", 0);
-				file.display_size.x = file_dict.get("display_size_x", 0);
-				file.display_size.y = file_dict.get("display_size_y", 0);
-				file.was_downsampled = file_dict.get("was_downsampled", false);
-				msg.attached_files.push_back(file);
-			}
-			
-			// Load tool results 
-			msg.tool_results = msg_dict.get("tool_results", Array());
-			
-			conv.messages.push_back(msg);
-		}
-		conversations.push_back(conv);
-	}
+    // Recover from temp file if present and final missing
+    String final_path = conversations_file_path;
+    String base_dir = final_path.get_base_dir();
+    String final_name = final_path.get_file();
+    String temp_name = final_name + ".tmp";
+    String temp_path = base_dir.path_join(temp_name);
+
+    // Fallback: also check project settings dir (some distributions differ)
+    String alt_final_path = final_path;
+    if (EditorPaths::get_singleton() && EditorPaths::get_singleton()->are_paths_valid()) {
+        alt_final_path = EditorPaths::get_singleton()->get_project_settings_dir().path_join("ai_chat_conversations.simplifine");
+    }
+
+    if (!FileAccess::exists(final_path) && FileAccess::exists(temp_path)) {
+        Ref<DirAccess> da = DirAccess::open(base_dir);
+        if (da.is_valid()) {
+            da->rename(temp_name, final_name);
+        }
+    }
+
+    if (!FileAccess::exists(final_path)) {
+        if (FileAccess::exists(alt_final_path)) {
+            final_path = alt_final_path; // load from alternative location
+            base_dir = final_path.get_base_dir();
+            final_name = final_path.get_file();
+            temp_name = final_name + ".tmp";
+            temp_path = base_dir.path_join(temp_name);
+        } else {
+            print_line("AI Chat: Conversations file not found at: " + conversations_file_path);
+            return;
+        }
+    }
+
+    Error err;
+    String file_content = FileAccess::get_file_as_string(final_path, &err);
+    if (err != OK) {
+        print_line("AI Chat: Failed to load conversations file");
+        return;
+    }
+
+    auto parse_json_string = [](const String &p_json, Dictionary &r_out) -> bool {
+        Ref<JSON> json;
+        json.instantiate();
+        Error perr = json->parse(p_json);
+        if (perr != OK) {
+            return false;
+        }
+        r_out = json->get_data();
+        return true;
+    };
+
+    Dictionary data;
+    bool parsed = parse_json_string(file_content, data);
+    if (!parsed && FileAccess::exists(temp_path)) {
+        // Try temp as fallback
+        String tmp_content = FileAccess::get_file_as_string(temp_path, &err);
+        if (err == OK) {
+            parsed = parse_json_string(tmp_content, data);
+        }
+    }
+    if (!parsed) {
+        print_line("AI Chat: Failed to parse conversations file (and temp fallback)");
+        return;
+    }
+
+    if (!data.has("conversations")) {
+        print_line("AI Chat: Conversations key missing in file: " + final_path);
+        return;
+    }
+
+    Array conversations_array = data["conversations"];
+    conversations.clear();
+
+    for (int i = 0; i < conversations_array.size(); i++) {
+        Dictionary conv_dict = conversations_array[i];
+        AIChatDock::Conversation conv;
+        conv.id = conv_dict.get("id", "");
+        conv.title = conv_dict.get("title", "");
+        conv.created_timestamp = conv_dict.get("created_timestamp", "");
+        conv.last_modified_timestamp = conv_dict.get("last_modified_timestamp", "");
+
+        Array messages_array = conv_dict.get("messages", Array());
+        for (int j = 0; j < messages_array.size(); j++) {
+            Dictionary msg_dict = messages_array[j];
+            AIChatDock::ChatMessage msg;
+            msg.role = msg_dict.get("role", "");
+            msg.content = msg_dict.get("content", "");
+            msg.timestamp = msg_dict.get("timestamp", "");
+            msg.tool_calls = msg_dict.get("tool_calls", Array());
+            msg.tool_call_id = msg_dict.get("tool_call_id", "");
+            msg.name = msg_dict.get("name", "");
+
+            // Load attached files
+            Array attached_files_array = msg_dict.get("attached_files", Array());
+            for (int k = 0; k < attached_files_array.size(); k++) {
+                Dictionary file_dict = attached_files_array[k];
+                AIChatDock::AttachedFile file;
+                file.path = file_dict.get("path", "");
+                file.name = file_dict.get("name", "");
+                file.content = file_dict.get("content", "");
+                file.is_image = file_dict.get("is_image", false);
+                file.mime_type = file_dict.get("mime_type", "");
+                file.base64_data = file_dict.get("base64_data", "");
+                // Support v2 array sizes and v1 x/y sizes
+                if (file_dict.has("original_size")) {
+                    Array os = file_dict.get("original_size", Array());
+                    if (os.size() >= 2) {
+                        file.original_size.x = int(os[0]);
+                        file.original_size.y = int(os[1]);
+                    }
+                } else {
+                    file.original_size.x = file_dict.get("original_size_x", 0);
+                    file.original_size.y = file_dict.get("original_size_y", 0);
+                }
+                if (file_dict.has("display_size")) {
+                    Array ds = file_dict.get("display_size", Array());
+                    if (ds.size() >= 2) {
+                        file.display_size.x = int(ds[0]);
+                        file.display_size.y = int(ds[1]);
+                    }
+                } else {
+                    file.display_size.x = file_dict.get("display_size_x", 0);
+                    file.display_size.y = file_dict.get("display_size_y", 0);
+                }
+                file.was_downsampled = file_dict.get("was_downsampled", false);
+                file.is_node = file_dict.get("is_node", false);
+                file.node_path = file_dict.get("node_path", NodePath());
+                file.node_type = file_dict.get("node_type", "");
+                msg.attached_files.push_back(file);
+            }
+
+            // Load tool results
+            msg.tool_results = msg_dict.get("tool_results", Array());
+
+            conv.messages.push_back(msg);
+        }
+        conversations.push_back(conv);
+    }
+    print_line("AI Chat: Loaded conversations: " + itos(conversations.size()) + " from: " + final_path);
 }
 
 void AIChatDock::_save_conversations() {
-	Dictionary data;
-	Array conversations_array;
-	
-	for (int i = 0; i < conversations.size(); i++) {
-		const AIChatDock::Conversation &conv = conversations[i];
-		Dictionary conv_dict;
-		conv_dict["id"] = conv.id;
-		conv_dict["title"] = conv.title;
-		conv_dict["created_timestamp"] = conv.created_timestamp;
-		conv_dict["last_modified_timestamp"] = conv.last_modified_timestamp;
-		
-		Array messages_array;
-		for (int j = 0; j < conv.messages.size(); j++) {
-			const ChatMessage &msg = conv.messages[j];
-			Dictionary msg_dict;
-			msg_dict["role"] = msg.role;
-			msg_dict["content"] = msg.content;
-			msg_dict["timestamp"] = msg.timestamp;
-			msg_dict["tool_calls"] = msg.tool_calls;
-			msg_dict["tool_call_id"] = msg.tool_call_id;
-			msg_dict["name"] = msg.name;
-			
-			// Save attached files
-			Array attached_files_array;
-			for (int k = 0; k < msg.attached_files.size(); k++) {
-				const AttachedFile &file = msg.attached_files[k];
-				Dictionary file_dict;
-				file_dict["path"] = file.path;
-				file_dict["name"] = file.name;
-				file_dict["content"] = file.content;
-				file_dict["is_image"] = file.is_image;
-				file_dict["mime_type"] = file.mime_type;
-				file_dict["base64_data"] = file.base64_data;
-				file_dict["original_size_x"] = file.original_size.x;
-				file_dict["original_size_y"] = file.original_size.y;
-				file_dict["display_size_x"] = file.display_size.x;
-				file_dict["display_size_y"] = file.display_size.y;
-				file_dict["was_downsampled"] = file.was_downsampled;
-				attached_files_array.push_back(file_dict);
-			}
-			msg_dict["attached_files"] = attached_files_array;
-			msg_dict["tool_results"] = msg.tool_results;
-			
-			messages_array.push_back(msg_dict);
-		}
-		conv_dict["messages"] = messages_array;
-		conversations_array.push_back(conv_dict);
-	}
-	
-	data["conversations"] = conversations_array;
-	
-	Ref<JSON> json;
-	json.instantiate();
-	String json_string = json->stringify(data, "  ");
-	
-	Error err;
-	Ref<FileAccess> file = FileAccess::open(conversations_file_path, FileAccess::WRITE, &err);
-	if (err != OK) {
-		print_line("AI Chat: Failed to save conversations file");
-		return;
-	}
-	
-	file->store_string(json_string);
-	file->close();
+    Dictionary data;
+    data["version"] = 2;
+    Array conversations_array;
+
+    for (int i = 0; i < conversations.size(); i++) {
+        const AIChatDock::Conversation &conv = conversations[i];
+        Dictionary conv_dict;
+        conv_dict["id"] = conv.id;
+        conv_dict["title"] = conv.title;
+        conv_dict["created_timestamp"] = conv.created_timestamp;
+        conv_dict["last_modified_timestamp"] = conv.last_modified_timestamp;
+
+        Array messages_array;
+        for (int j = 0; j < conv.messages.size(); j++) {
+            const ChatMessage &msg = conv.messages[j];
+            Dictionary msg_dict;
+            msg_dict["role"] = msg.role;
+            msg_dict["content"] = msg.content;
+            msg_dict["timestamp"] = msg.timestamp;
+            msg_dict["tool_calls"] = msg.tool_calls;
+            msg_dict["tool_call_id"] = msg.tool_call_id;
+            msg_dict["name"] = msg.name;
+            msg_dict["tool_results"] = msg.tool_results;
+
+            // Save attached files
+            Array attached_files_array;
+            for (int k = 0; k < msg.attached_files.size(); k++) {
+                const AttachedFile &file = msg.attached_files[k];
+                Dictionary file_dict;
+                file_dict["path"] = file.path;
+                file_dict["name"] = file.name;
+                file_dict["content"] = file.content;
+                file_dict["is_image"] = file.is_image;
+                file_dict["mime_type"] = file.mime_type;
+                file_dict["base64_data"] = file.base64_data;
+                // v2 array sizes + v1 compatibility keys
+                Array os;
+                os.push_back(file.original_size.x);
+                os.push_back(file.original_size.y);
+                file_dict["original_size"] = os;
+                Array ds;
+                ds.push_back(file.display_size.x);
+                ds.push_back(file.display_size.y);
+                file_dict["display_size"] = ds;
+                file_dict["original_size_x"] = file.original_size.x;
+                file_dict["original_size_y"] = file.original_size.y;
+                file_dict["display_size_x"] = file.display_size.x;
+                file_dict["display_size_y"] = file.display_size.y;
+                file_dict["was_downsampled"] = file.was_downsampled;
+                file_dict["is_node"] = file.is_node;
+                file_dict["node_path"] = file.node_path;
+                file_dict["node_type"] = file.node_type;
+                attached_files_array.push_back(file_dict);
+            }
+            msg_dict["attached_files"] = attached_files_array;
+
+            messages_array.push_back(msg_dict);
+        }
+        conv_dict["messages"] = messages_array;
+        conversations_array.push_back(conv_dict);
+    }
+
+    data["conversations"] = conversations_array;
+
+    Ref<JSON> json;
+    json.instantiate();
+    String json_string = json->stringify(data, "  ");
+
+    // Safe write via temp + rename
+    Error err;
+    String final_path = conversations_file_path;
+    String base_dir = final_path.get_base_dir();
+    String final_name = final_path.get_file();
+    String temp_name = final_name + ".tmp";
+    String temp_path = base_dir.path_join(temp_name);
+
+    // Ensure destination directory exists
+    {
+        Ref<DirAccess> da_mk = DirAccess::create_for_path(base_dir);
+        if (da_mk.is_valid() && !da_mk->dir_exists(base_dir)) {
+            da_mk->make_dir_recursive(base_dir);
+        }
+    }
+
+    {
+        Ref<FileAccess> tmp = FileAccess::open(temp_path, FileAccess::WRITE, &err);
+        if (err != OK) {
+            print_line("AI Chat: Failed to open temp file for save");
+            return;
+        }
+        tmp->store_string(json_string);
+        tmp->close();
+    }
+
+    Ref<DirAccess> da = DirAccess::open(base_dir);
+    if (da.is_valid()) {
+        if (da->file_exists(final_name)) {
+            da->remove(final_name);
+        }
+        da->rename(temp_name, final_name);
+    } else {
+        Ref<FileAccess> file = FileAccess::open(final_path, FileAccess::WRITE, &err);
+        if (err != OK) {
+            print_line("AI Chat: Failed to save conversations file");
+            return;
+        }
+        file->store_string(json_string);
+        file->close();
+    }
 }
 
 void AIChatDock::_create_new_conversation() {
@@ -4980,6 +5114,7 @@ void AIChatDock::_on_new_conversation_pressed() {
 	
 	// Use delayed save to avoid UI blocking
 	_queue_delayed_save();
+	_execute_delayed_save(); // start background save immediately
 }
 
 void AIChatDock::_build_hierarchy_tree_item(Tree *p_tree, TreeItem *p_parent, const Dictionary &p_node_data) {
@@ -5244,7 +5379,7 @@ void AIChatDock::_display_generated_image_deferred(const String &p_base64_data, 
 		return;
 	}
 	
-	// Find and clear the tool placeholder containing "⚡ Calling tool..." text
+    // Find and clear the tool placeholder containing "Running tool..." text
 	print_line("AI Chat: Searching for tool placeholder in message vbox, children count: " + String::num_int64(message_vbox->get_child_count()));
 	bool found_placeholder = false;
 	for (int i = 0; i < message_vbox->get_child_count(); i++) {
@@ -5264,7 +5399,7 @@ void AIChatDock::_display_generated_image_deferred(const String &p_base64_data, 
 			
 			// Add success message
 			Label *success_label = memnew(Label);
-			success_label->set_text("✓ Generated image");
+			success_label->set_text("Generated image");
 			success_label->add_theme_color_override("font_color", get_theme_color(SNAME("success_color"), SNAME("Editor")));
 			success_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
 			panel->add_child(success_label);
@@ -5278,7 +5413,7 @@ void AIChatDock::_display_generated_image_deferred(const String &p_base64_data, 
 		if (label && label->get_text().contains("Calling tool")) {
 			print_line("AI Chat: Found RichTextLabel with tool text, updating");
 			label->clear();
-			label->append_text("✓ Generated image\n\n");
+			label->append_text("Generated image\n\n");
 			found_placeholder = true;
 			break;
 		}
@@ -5307,8 +5442,8 @@ void AIChatDock::_display_generated_image_deferred(const String &p_base64_data, 
 	image_panel->add_child(image_container);
 	
 	// Add "Generated Image" label
-	Label *header_label = memnew(Label);
-	header_label->set_text("✨ Generated Image");
+    Label *header_label = memnew(Label);
+    header_label->set_text("Generated Image");
 	header_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
 	header_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
 	image_container->add_child(header_label);
@@ -5331,12 +5466,12 @@ void AIChatDock::_display_generated_image_deferred(const String &p_base64_data, 
 	image_display->set_custom_minimum_size(Size2(display_size.x, display_size.y));
 	image_container->add_child(image_display);
 	
-	// Add image info
-	HBoxContainer *info_container = memnew(HBoxContainer);
+    // Add image info
+    HBoxContainer *info_container = memnew(HBoxContainer);
 	image_container->add_child(info_container);
 	
 	Label *size_label = memnew(Label);
-	size_label->set_text(String::num_int64(original_size.x) + "×" + String::num_int64(original_size.y));
+	size_label->set_text(String::num_int64(original_size.x) + "x" + String::num_int64(original_size.y));
 	size_label->add_theme_font_size_override("font_size", 10);
 	size_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 	info_container->add_child(size_label);
@@ -5456,11 +5591,14 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	prompt_icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
 	prompt_container->add_child(prompt_icon);
 	
-	Label *prompt_label = memnew(Label);
+    Label *prompt_label = memnew(Label);
 	String prompt = p_data.get("prompt", "Generated Image");
 	prompt_label->set_text(prompt);
 	prompt_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
 	prompt_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+    prompt_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+    prompt_label->set_clip_text(false);
+    prompt_label->set_custom_minimum_size(Size2(0, 0));
 	prompt_container->add_child(prompt_label);
 	
 	// Resize image for display (max 200px in tool results to keep them compact)
@@ -5486,7 +5624,7 @@ void AIChatDock::_display_generated_image_in_tool_result(VBoxContainer *p_contai
 	image_container->add_child(tech_container);
 	
 	Label *size_label = memnew(Label);
-	size_label->set_text(String::num_int64(original_size.x) + "×" + String::num_int64(original_size.y));
+	size_label->set_text(String::num_int64(original_size.x) + "x" + String::num_int64(original_size.y));
 	size_label->add_theme_font_size_override("font_size", 10);
 	size_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 	tech_container->add_child(size_label);
@@ -5555,22 +5693,28 @@ void AIChatDock::_display_image_unified(VBoxContainer *p_container, const String
 	bool is_generated = file_path.begins_with("generated://");
 	int max_display_size = is_generated ? 200 : 150; // Generated images slightly larger
 	
-	// Add image title/info
-	HBoxContainer *info_container = memnew(HBoxContainer);
-	image_container->add_child(info_container);
-	
-	HBoxContainer *title_container = memnew(HBoxContainer);
-	info_container->add_child(title_container);
-	
-	Label *icon = memnew(Label);
-	icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
-	title_container->add_child(icon);
-	
-	Label *title_label = memnew(Label);
-	title_label->set_text(title);
-	title_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
-	title_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
-	title_container->add_child(title_label);
+    // Add image title/info with proper wrapping so long text doesn't expand panel width
+    HBoxContainer *info_container = memnew(HBoxContainer);
+    info_container->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    image_container->add_child(info_container);
+
+    // Left: icon
+    Label *icon = memnew(Label);
+    icon->add_theme_icon_override("icon", get_theme_icon(SNAME("Image"), SNAME("EditorIcons")));
+    info_container->add_child(icon);
+
+    // Right: a wrapping label in a VBox so it can take full width and wrap
+    VBoxContainer *title_vbox = memnew(VBoxContainer);
+    title_vbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    info_container->add_child(title_vbox);
+
+    Label *title_label = memnew(Label);
+    title_label->set_text(title);
+    title_label->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    title_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+    title_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+    title_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+    title_vbox->add_child(title_label);
 	
 	// Resize image for display
 	Vector2i original_size = Vector2i(display_image->get_width(), display_image->get_height());
@@ -5596,7 +5740,7 @@ void AIChatDock::_display_image_unified(VBoxContainer *p_container, const String
 	
 	// Size info
 	Label *size_label = memnew(Label);
-	size_label->set_text(String::num_int64(original_size.x) + "×" + String::num_int64(original_size.y));
+	size_label->set_text(String::num_int64(original_size.x) + "x" + String::num_int64(original_size.y));
 	size_label->add_theme_font_size_override("font_size", 10);
 	size_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 	details_container->add_child(size_label);
@@ -5714,7 +5858,7 @@ void AIChatDock::_update_tool_placeholder_status(const String &p_tool_id, const 
 		Label *tool_label = Object::cast_to<Label>(tool_hbox->get_child(0));
 		if (tool_label) {
 			if (p_status == "starting") {
-				tool_label->set_text("⚡ Executing: " + p_tool_name + "...");
+				tool_label->set_text("Executing: " + p_tool_name + "...");
 				tool_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(0.2, 0.8, 1.0, 1.0)); // Blue color for executing
 			}
 		}
@@ -5722,15 +5866,15 @@ void AIChatDock::_update_tool_placeholder_status(const String &p_tool_id, const 
 }
 
 void AIChatDock::_create_assistant_message_for_backend_tool(const String &p_tool_name) {
-	// Create a proper assistant message bubble that can later receive content
-	_add_message_to_chat("assistant", "⚡ Executing: " + p_tool_name + "...");
+    // Create a proper assistant message bubble that can later receive content
+    _add_message_to_chat("assistant", "Executing: " + p_tool_name + "...");
 }
 
 void AIChatDock::_create_assistant_message_with_tool_placeholder(const String &p_tool_name, const String &p_tool_id) {
 	// Add to chat history first
 	AIChatDock::ChatMessage msg;
 	msg.role = "assistant";
-	msg.content = "⚡ Calling tool: " + p_tool_name + "...";
+    msg.content = "Running tool: " + p_tool_name + "...";
 	msg.timestamp = _get_timestamp();
 	
 	Vector<AIChatDock::ChatMessage> &chat_history = _get_current_chat_history();
@@ -5786,7 +5930,7 @@ void AIChatDock::_create_assistant_message_with_tool_placeholder(const String &p
 	placeholder->add_child(tool_hbox);
 
 	Label *tool_label = memnew(Label);
-	tool_label->set_text("⚡ Calling tool: " + p_tool_name + "...");
+    tool_label->set_text("Running tool: " + p_tool_name + "...");
 	tool_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(0.2, 0.8, 1.0, 1.0)); // Blue color for executing
 	tool_label->add_theme_icon_override("icon", get_theme_icon(SNAME("Tools"), SNAME("EditorIcons")));
 	tool_hbox->add_child(tool_label);
@@ -5837,8 +5981,8 @@ void AIChatDock::_create_backend_tool_placeholder(const String &p_tool_id, const
 	HBoxContainer *tool_hbox = memnew(HBoxContainer);
 	placeholder->add_child(tool_hbox);
 
-	Label *tool_label = memnew(Label);
-	tool_label->set_text("⚡ Executing: " + p_tool_name + "...");
+    Label *tool_label = memnew(Label);
+    tool_label->set_text("Executing: " + p_tool_name + "...");
 	tool_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(0.2, 0.8, 1.0, 1.0));
 	tool_label->add_theme_icon_override("icon", get_theme_icon(SNAME("Tools"), SNAME("EditorIcons")));
 	tool_hbox->add_child(tool_label);

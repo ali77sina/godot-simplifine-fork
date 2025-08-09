@@ -391,3 +391,4 @@ $RECYCLE.BIN/
 *.msp
 *.lnk
 *.generated.props
+dist/

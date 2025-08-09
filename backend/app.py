@@ -158,6 +158,13 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
         image_ids = arguments.get('images', []) or []
         size = arguments.get('size', '1024x1024')  # optional
 
+        print("IMAGE_OP DEBUG: Incoming arguments:")
+        print(f"  - description len: {len(description)} | style: '{style}' | size: {size}")
+        if isinstance(image_ids, list):
+            print(f"  - requested image ids: {image_ids} (count={len(image_ids)})")
+        else:
+            print(f"  - images field type: {type(image_ids)} -> {image_ids}")
+
         if not description:
             return {"success": False, "error": "No description provided for image operation"}
 
@@ -168,19 +175,48 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
         # Gather available images from prior conversation messages
         available_images = {}
         if conversation_messages:
+            print(f"IMAGE_OP DEBUG: conversation_messages count: {len(conversation_messages)}")
+            cm_index = -1
             for msg in conversation_messages:
-                if isinstance(msg, dict) and 'images' in msg:
+                cm_index += 1
+                if not isinstance(msg, dict):
+                    continue
+                if 'images' in msg and isinstance(msg['images'], list):
+                    print(f"    - msg[{cm_index}] has images: {len(msg['images'])}")
                     for img in msg['images']:
-                        if img.get('base64_data') and img.get('name'):
-                            available_images[img['name']] = img
+                        name = img.get('name')
+                        b64 = img.get('base64_data')
+                        if name and b64:
+                            available_images[name] = img
+                            print(f"      -> cached image '{name}' (base64 len={len(b64)})")
+                # Also log tool/assistant markers present in content
+                content_preview = str(msg.get('content', ''))[:120].replace('\n', ' ')
+                if 'image_name' in content_preview or 'Image ID' in content_preview:
+                    print(f"    - msg[{cm_index}] content mentions image id: '{content_preview}'")
+        else:
+            print("IMAGE_OP DEBUG: No conversation_messages provided or empty")
 
         selected_images = []
         for img_id in image_ids:
+            # Accept both exact and numeric-suffixed IDs (e.g., 'generated_123' vs 'generated_123.0')
+            match = None
             if img_id in available_images:
-                selected_images.append(available_images[img_id])
+                match = available_images[img_id]
+            else:
+                # Try tolerant matching
+                for key in available_images.keys():
+                    if str(key).startswith(str(img_id)):
+                        match = available_images[key]
+                        print(f"IMAGE_OP DEBUG: tolerant match for '{img_id}' -> '{key}'")
+                        break
+            if match:
+                selected_images.append(match)
                 print(f"IMAGE_OP: Selected input image '{img_id}'")
             else:
                 print(f"IMAGE_OP: Warning - requested image '{img_id}' not found in conversation context")
+
+        print(f"IMAGE_OP DEBUG: available_images keys: {list(available_images.keys())}")
+        print(f"IMAGE_OP DEBUG: selected_images count: {len(selected_images)}")
 
         # If no images selected, do text-to-image generation
         if not selected_images:
@@ -205,12 +241,14 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
         first_img = selected_images[0]
         try:
             img_bytes = base64.b64decode(first_img['base64_data'])
+            print(f"IMAGE_OP DEBUG: decoded first image bytes: {len(img_bytes)}")
         except Exception as decode_err:
             return {"success": False, "error": f"Failed to decode input image '{first_img.get('name','unknown')}': {decode_err}"}
 
         # Re-encode to PNG to ensure a valid image mimetype and structure
         try:
             pil_image = Image.open(io.BytesIO(img_bytes))
+            print(f"IMAGE_OP DEBUG: PIL loaded size: {pil_image.size} | mode: {pil_image.mode}")
         except Exception as pil_err:
             return {"success": False, "error": f"Failed to load input image: {pil_err}"}
 
@@ -223,6 +261,7 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
             with open(temp_path, "rb") as img_fh:
                 # Prefer images.edits if available in SDK; otherwise fall back to images.edit
                 images_api = getattr(client, 'images')
+                print(f"IMAGE_OP DEBUG: Using images API method: {'edits' if hasattr(images_api, 'edits') else 'edit'} | prompt len={len(prompt_text)}")
                 if hasattr(images_api, 'edits'):
                     edit = images_api.edits(model="gpt-image-1", image=img_fh, prompt=prompt_text, size=size)
                 else:
@@ -236,6 +275,7 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
                     pass
 
         if not edit.data or not getattr(edit.data[0], 'b64_json', None):
+            print("IMAGE_OP DEBUG: Edit API returned no data or missing b64_json")
             return {"success": False, "error": "Image edit returned no data"}
 
         image_base64 = edit.data[0].b64_json
@@ -1160,8 +1200,13 @@ def chat():
                                 yield json.dumps({"status": "stopped", "message": "Request stopped after tool execution"}) + '\n'
                                 return
                             
-                            # Yield result to frontend immediately
-                            yield json.dumps({"tool_executed": "image_operation", "tool_result": image_result, "status": "tool_completed"}) + '\n'
+                            # Yield result to frontend immediately (include tool_call_id for consistent UI handling)
+                            yield json.dumps({
+                                "tool_executed": "image_operation",
+                                "tool_result": image_result,
+                                "tool_call_id": tool_id,
+                                "status": "tool_completed"
+                            }) + '\n'
                             
                             # Prepare tool result for conversation history (exclude massive image data)
                             tool_result_for_openai = {
