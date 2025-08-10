@@ -79,9 +79,9 @@ private:
 			return rt;
 		}
 		for (int i = 0; i < p_node->get_child_count(); i++) {
-			RichTextLabel *rt = find_rich_text_label_in_children(p_node->get_child(i));
-			if (rt) {
-				return rt;
+			RichTextLabel *child_rt = find_rich_text_label_in_children(p_node->get_child(i));
+			if (child_rt) {
+				return child_rt;
 			}
 		}
 		return nullptr;
