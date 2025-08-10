@@ -30,15 +30,15 @@
 
 #pragma once
 
-#include "core/io/http_client.h"
-#include "core/io/image.h"
-#include "scene/gui/box_container.h"
-#include "scene/gui/texture_rect.h"
-#include "scene/gui/dialogs.h"
-#include "scene/main/http_request.h"
-#include "diff_viewer.h"
 #include "ai_tool_server.h"
 #include "common.h"
+#include "core/io/http_client.h"
+#include "core/io/image.h"
+#include "diff_viewer.h"
+#include "scene/gui/box_container.h"
+#include "scene/gui/dialogs.h"
+#include "scene/gui/texture_rect.h"
+#include "scene/main/http_request.h"
 
 class Button;
 class MenuButton;
@@ -86,8 +86,6 @@ private:
 		}
 		return nullptr;
 	}
-
-
 
 	struct AttachedFile {
 		String path;
@@ -141,12 +139,12 @@ private:
 	EditorFileDialog *file_dialog = nullptr;
 	EditorFileDialog *save_image_dialog = nullptr;
 	AcceptDialog *image_warning_dialog = nullptr;
-	
+
 	// Embedding system state
 	HTTPRequest *embedding_request = nullptr;
 	bool embedding_system_initialized = false;
 	bool initial_indexing_done = false;
-	
+
 	// User authentication
 	HTTPRequest *auth_request = nullptr;
 	Button *login_button = nullptr;
@@ -154,7 +152,7 @@ private:
 	String current_user_id;
 	String current_user_name;
 	String auth_token;
-	
+
 	// Login polling
 	Timer *login_poll_timer = nullptr;
 	int login_poll_attempts = 0;
@@ -164,14 +162,14 @@ private:
 	PopupPanel *scene_tree_popup = nullptr;
 	Tree *scene_tree = nullptr;
 	EditorFileDialog *resource_dialog = nullptr;
-	
+
 	// For saving images
 	String pending_save_image_data; // Base64 image data to save
 	String pending_save_image_format; // "png" or "jpg"
-	
+
 	// For delayed saving performance optimization
 	bool save_pending = false;
-	
+
 	// Background saving to prevent UI freezing
 	Thread *save_thread = nullptr;
 	Mutex *save_mutex = nullptr;
@@ -192,7 +190,7 @@ private:
 	String pending_request_path;
 	PackedStringArray pending_request_headers;
 	PackedByteArray pending_request_body;
-	
+
 	RichTextLabel *current_assistant_message_label = nullptr;
 	String response_buffer;
 	Array _chunked_messages; // For processing large conversations in chunks
@@ -204,14 +202,14 @@ private:
 	Vector<AttachedFile> current_attached_files;
 	String conversations_file_path;
 	String api_key;
-    String api_endpoint = "https://gamechat.simplifine.com/chat";
+	String api_endpoint = "https://gamechat.simplifine.com/chat";
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;
 	
 	// Track displayed images to prevent duplication
 	HashSet<String> current_displayed_images;
-	
+
 	// Stop mechanism
 	String current_request_id;
 	bool stop_requested = false;
