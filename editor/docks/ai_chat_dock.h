@@ -206,7 +206,7 @@ private:
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;
-	
+
 	// Track displayed images to prevent duplication
 	HashSet<String> current_displayed_images;
 
@@ -274,7 +274,7 @@ private:
 	void _clear_attachments();
 	String _get_timestamp();
 	void _scroll_to_bottom();
-	
+
 	// Conversation management
 	void _load_conversations();
 	void _save_conversations();
@@ -308,19 +308,19 @@ private:
 	String _get_mime_type_from_extension(const String &p_path);
 	bool _process_image_attachment(AttachedFile &p_file);
 	Vector2i _calculate_downsampled_size(const Vector2i &p_original, int p_max_dimension = 1024);
-	
+
 	// UI validation helpers
 	bool _is_label_descendant_of_node(Node *p_label, Node *p_node);
 	void _show_image_warning_dialog(const String &p_filename, const Vector2i &p_original, const Vector2i &p_new_size);
-	
+
 	// Image generation handling
 	void _handle_generated_image(const String &p_base64_data, const String &p_id);
 	void _display_generated_image_deferred(const String &p_base64_data, const String &p_id);
 	void _display_generated_image_in_tool_result(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_data);
-	
+
 	// Unified image display method for all image types
 	void _display_image_unified(VBoxContainer *p_container, const String &p_base64_data, const Dictionary &p_metadata = Dictionary());
-	
+
 	// Drag and drop support
 	bool can_drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from) const;
 	void drop_data_fw(const Point2 &p_point, const Variant &p_data, Control *p_from);
@@ -330,19 +330,19 @@ private:
 	void _attach_external_files(const Vector<String> &p_files);
 	void _attach_dragged_nodes(const Array &p_nodes);
 	String _get_file_type_icon(const AttachedFile &p_file);
-	
+
 	// Attachment helpers
 	void _attach_scene_node(Node *p_node);
 	void _attach_current_script();
 	void _populate_scene_tree_recursive(Node *p_node, TreeItem *p_parent);
 	String _get_node_info_string(Node *p_node);
-	
+
 	// Tool execution feedback
 	void _update_tool_placeholder_status(const String &p_tool_id, const String &p_tool_name, const String &p_status);
 	void _create_backend_tool_placeholder(const String &p_tool_id, const String &p_tool_name);
 	void _create_assistant_message_for_backend_tool(const String &p_tool_name);
 	void _create_assistant_message_with_tool_placeholder(const String &p_tool_name, const String &p_tool_id);
-	
+
 	// Embedding system for project indexing
 	void _initialize_embedding_system();
 	void _perform_initial_indexing();
@@ -354,11 +354,11 @@ private:
 	void _on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	bool _should_index_file(const String &p_file_path);
 	String _get_project_root_path();
-	
+
 	// Smart context attachment based on embeddings
 	void _suggest_relevant_files(const String &p_query);
 	void _auto_attach_relevant_context();
-	
+
 	// User authentication methods
 	void _setup_authentication_ui();
 	void _on_login_button_pressed();
@@ -381,16 +381,16 @@ protected:
 public:
 	AIChatDock();
 	~AIChatDock();
-	
+
 	void clear_chat_history();
 	void clear_current_conversation();
 	void set_api_key(const String &p_api_key);
 	void set_api_endpoint(const String &p_endpoint);
 	void set_model(const String &p_model);
 	void send_error_message(const String &p_error_text);
-	
+
 	// Authentication getters for EditorTools
 	String get_current_user_id() const { return current_user_id; }
 	String get_machine_id() const;
 	String get_auth_token() const { return auth_token; }
-}; 
+};
