@@ -25,6 +25,53 @@
 #include "modules/gdscript/gdscript_compiler.h"
 
 #include <functional>
+#include <utility>
+// Static members for simple signal tracing
+EditorTools *EditorTools::tracer_instance = nullptr;
+Dictionary EditorTools::trace_registry;
+Dictionary EditorTools::property_watch_registry;
+
+EditorTools *EditorTools::ensure_tracer() {
+    if (!tracer_instance) {
+        tracer_instance = memnew(EditorTools);
+        // Not added to scene; used for method binding only
+    }
+    return tracer_instance;
+}
+
+void EditorTools::_record_trace_event(const String &trace_id, const String &src_path, const String &sig_name, const Array &args) {
+    if (!trace_registry.has(trace_id)) return;
+    Dictionary reg = trace_registry[trace_id];
+    Array events = reg.get("events", Array());
+    int max_events = reg.get("max_events", 100);
+    int next_index = reg.get("next_index", 0);
+    Dictionary evt;
+    evt["i"] = next_index;
+    evt["time_ms"] = OS::get_singleton()->get_ticks_msec();
+    evt["source_path"] = src_path;
+    evt["signal"] = sig_name;
+    if (!args.is_empty()) evt["args"] = args;
+    events.push_back(evt);
+    while (events.size() > max_events) { events.remove_at(0); }
+    reg["events"] = events; reg["next_index"] = next_index + 1;
+    trace_registry[trace_id] = reg;
+}
+
+void EditorTools::_on_traced_signal_0(const String &p_trace_id, const String &p_source_path, const String &p_signal_name) {
+    _record_trace_event(p_trace_id, p_source_path, p_signal_name, Array());
+}
+void EditorTools::_on_traced_signal_1(const Variant &a0, const String &p_trace_id, const String &p_source_path, const String &p_signal_name) {
+    Array args; args.push_back(a0); _record_trace_event(p_trace_id, p_source_path, p_signal_name, args);
+}
+void EditorTools::_on_traced_signal_2(const Variant &a0, const Variant &a1, const String &p_trace_id, const String &p_source_path, const String &p_signal_name) {
+    Array args; args.push_back(a0); args.push_back(a1); _record_trace_event(p_trace_id, p_source_path, p_signal_name, args);
+}
+void EditorTools::_on_traced_signal_3(const Variant &a0, const Variant &a1, const Variant &a2, const String &p_trace_id, const String &p_source_path, const String &p_signal_name) {
+    Array args; args.push_back(a0); args.push_back(a1); args.push_back(a2); _record_trace_event(p_trace_id, p_source_path, p_signal_name, args);
+}
+void EditorTools::_on_traced_signal_4(const Variant &a0, const Variant &a1, const Variant &a2, const Variant &a3, const String &p_trace_id, const String &p_source_path, const String &p_signal_name) {
+    Array args; args.push_back(a0); args.push_back(a1); args.push_back(a2); args.push_back(a3); _record_trace_event(p_trace_id, p_source_path, p_signal_name, args);
+}
 
 void EditorTools::set_api_endpoint(const String &p_endpoint) {
     // This is now handled in AIChatDock
@@ -40,9 +87,9 @@ Dictionary EditorTools::_get_node_info(Node *p_node) {
 	
 	// Get scene-relative path instead of absolute path
 	Node *scene_root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
-	if (scene_root && p_node == scene_root) {
-		// This is the scene root itself
-		node_info["path"] = p_node->get_name();
+    if (scene_root && p_node == scene_root) {
+        // This is the scene root itself. Use "." as canonical root-relative path
+        node_info["path"] = String(".");
 	} else if (scene_root && scene_root->is_ancestor_of(p_node)) {
 		// Get relative path from scene root
 		node_info["path"] = scene_root->get_path_to(p_node);
@@ -63,11 +110,102 @@ Node *EditorTools::_get_node_from_path(const String &p_path, Dictionary &r_error
 		r_error_result["message"] = "No scene is currently being edited.";
 		return nullptr;
 	}
-	Node *node = root->get_node_or_null(p_path);
-	if (!node) {
-		r_error_result["success"] = false;
-		r_error_result["message"] = "Node not found at path: " + p_path;
-	}
+    // Accept common root references and tolerant root-name matching
+    if (p_path.is_empty() || p_path == "." || p_path.to_lower() == String(root->get_name()).to_lower()) {
+        return root;
+    }
+    // Normalize a few absolute/root-like prefixes
+    String norm_path = p_path;
+    if (norm_path.begins_with("/")) {
+        // Absolute paths are editor-tree relative; try stripping leading slash and root name
+        norm_path = norm_path.substr(1);
+        if (norm_path.begins_with(String(root->get_name()) + "/")) {
+            norm_path = norm_path.substr(String(root->get_name()).length() + 1);
+        }
+    }
+    if (norm_path == String(root->get_name())) {
+        return root;
+    }
+
+    Node *node = root->get_node_or_null(norm_path);
+    if (!node && !norm_path.begins_with("./") && norm_path.begins_with(".")) {
+        String alt = norm_path;
+        if (alt.begins_with("./")) alt = alt.substr(2);
+        node = root->get_node_or_null(alt);
+    }
+    if (!node && !norm_path.begins_with("./") && !norm_path.begins_with(".")) {
+        String prefixed = String("./") + norm_path;
+        node = root->get_node_or_null(prefixed);
+    }
+    if (!node && !norm_path.contains("/")) {
+        String target_name_lc = norm_path.to_lower();
+        std::function<Node*(Node*)> dfs = [&](Node *n) -> Node* {
+            if (!n) return nullptr;
+            if (String(n->get_name()).to_lower() == target_name_lc) return n;
+            for (int i = 0; i < n->get_child_count(); i++) {
+                if (Node *res = dfs(n->get_child(i))) return res;
+            }
+            return nullptr;
+        };
+        node = dfs(root);
+    }
+    // Tolerant segment-wise resolution: allow matching by name (case-insensitive), by class name,
+    // and normalize engine-generated instance names like "@Area2D@24529"
+    if (!node && norm_path.find("/") != -1) {
+        Vector<String> segments = norm_path.split("/");
+        // Skip an initial segment equal to root name
+        int start_i = 0;
+        if (segments.size() > 0 && segments[0].to_lower() == String(root->get_name()).to_lower()) {
+            start_i = 1;
+        }
+        Node *current = root;
+        for (int i = start_i; i < segments.size() && current; i++) {
+            String seg = segments[i].strip_edges();
+            if (seg.is_empty() || seg == ".") continue;
+            // Normalize engine instance-style segments: @Class@12345 -> Class
+            String class_hint;
+            if (seg.begins_with("@")) {
+                // Extract between first two '@' as class hint if present
+                int second = seg.find("@", 1);
+                if (second > 1) {
+                    class_hint = seg.substr(1, second - 1);
+                }
+            }
+
+            Node *exact = current->get_node_or_null(seg);
+            if (exact) {
+                current = exact;
+                continue;
+            }
+            // Try case-insensitive name match among direct children
+            Node *match = nullptr;
+            for (int c = 0; c < current->get_child_count(); c++) {
+                Node *child = current->get_child(c);
+                if (String(child->get_name()).to_lower() == seg.to_lower()) { match = child; break; }
+            }
+            if (!match) {
+                // Try class-name match among direct children (e.g., "AnimatedSprite2D")
+                for (int c = 0; c < current->get_child_count(); c++) {
+                    Node *child = current->get_child(c);
+                    if (String(child->get_class()).to_lower() == seg.to_lower()) { match = child; break; }
+                }
+            }
+            if (!match && !class_hint.is_empty()) {
+                String lc = class_hint.to_lower();
+                for (int c = 0; c < current->get_child_count(); c++) {
+                    Node *child = current->get_child(c);
+                    if (String(child->get_class()).to_lower() == lc) { match = child; break; }
+                }
+            }
+            current = match; // may become null breaking the loop
+        }
+        node = current;
+    }
+    if (!node) {
+        r_error_result["success"] = false;
+        r_error_result["error_code"] = "NODE_NOT_FOUND";
+        r_error_result["message"] = "Node not found at path: " + p_path + " (root='" + String(root->get_name()) + "')";
+    }
 	return node;
 }
 
@@ -302,10 +440,61 @@ Dictionary EditorTools::set_node_property(const Dictionary &p_args) {
 	if (!node) {
 		return result;
 	}
-	StringName prop = p_args["property"];
-	Variant value = p_args["value"];
+    StringName prop = p_args["property"];
+    Variant value = p_args["value"];
 	
-	// Special handling for color properties
+    // Special handling for Vector2-like properties from flexible inputs
+    if ((prop == StringName("position") || prop == StringName("global_position") || prop == StringName("scale"))) {
+        // Accept [x, y], {x, y}, or "x,y"/"x y" strings
+        Vector2 vec2_value;
+        bool has_vec2 = false;
+
+        if (value.get_type() == Variant::ARRAY) {
+            Array arr = value;
+            if (arr.size() >= 2 && arr[0].get_type() != Variant::NIL && arr[1].get_type() != Variant::NIL) {
+                vec2_value = Vector2(arr[0], arr[1]);
+                has_vec2 = true;
+            }
+        } else if (value.get_type() == Variant::DICTIONARY) {
+            Dictionary d = value;
+            if ((d.has("x") || d.has("X")) && (d.has("y") || d.has("Y"))) {
+                Variant vx = d.has("x") ? d["x"] : d["X"];
+                Variant vy = d.has("y") ? d["y"] : d["Y"];
+                vec2_value = Vector2((double)vx, (double)vy);
+                has_vec2 = true;
+            }
+        } else if (value.get_type() == Variant::STRING) {
+            String s = (String)value;
+            // Allow formats like "x,y" or "x y"
+            s = s.strip_edges();
+            PackedStringArray parts = s.split(",");
+            if (parts.size() < 2) {
+                parts = s.split(" ");
+            }
+            if (parts.size() >= 2) {
+                vec2_value = Vector2(parts[0].strip_edges().to_float(), parts[1].strip_edges().to_float());
+                has_vec2 = true;
+            }
+        }
+
+        if (has_vec2) {
+            value = vec2_value;
+        }
+    }
+
+    // If value is a resource path string, attempt to load it as a Resource (helps for properties like sprite_frames, material, texture, etc.)
+    if (value.get_type() == Variant::STRING) {
+        String s = (String)value;
+        if (s.begins_with("res://") || s.ends_with(".tres") || s.ends_with(".res") || s.ends_with(".png") || s.ends_with(".jpg") || s.ends_with(".jpeg")) {
+            Ref<Resource> res = ResourceLoader::load(s);
+            if (res.is_valid()) {
+                value = res;
+                print_line("SET_NODE_PROPERTY: Loaded resource from path for property '" + String(prop) + "': " + s);
+            }
+        }
+    }
+
+    // Special handling for color properties
 	if (prop == "color" || prop == "modulate" || prop == "self_modulate") {
 		if (value.get_type() == Variant::STRING) {
 			String color_str = value;
@@ -353,11 +542,12 @@ Dictionary EditorTools::set_node_property(const Dictionary &p_args) {
 	
 	bool valid = false;
 	node->set(prop, value, &valid);
-	if (!valid) {
-		result["success"] = false;
-		result["message"] = "Failed to set property '" + String(prop) + "'. It might be invalid or read-only. Node type: " + node->get_class();
-		return result;
-	}
+    if (!valid) {
+        result["success"] = false;
+        result["error_code"] = "PROPERTY_INVALID_OR_READONLY";
+        result["message"] = "Failed to set property '" + String(prop) + "'. It might be invalid or read-only. Node type: " + node->get_class();
+        return result;
+    }
 	
 	// Auto-save the scene after property changes so changes persist when running the game
 	String current_scene = EditorNode::get_singleton()->get_edited_scene()->get_scene_file_path();
@@ -886,14 +1076,33 @@ Dictionary EditorTools::read_file_content(const Dictionary &p_args) {
 	String path = p_args["path"];
 	Error err;
 	String content = FileAccess::get_file_as_string(path, &err);
-	if (err != OK) {
-		result["success"] = false;
-		result["message"] = "Failed to read file: " + path;
-		return result;
-	}
-	result["success"] = true;
-	result["content"] = content;
-	return result;
+    if (err == OK) {
+        result["success"] = true;
+        result["content"] = content;
+        return result;
+    }
+
+    // Fallback: attempt a bounded preview for very large or special files (e.g., big .tres)
+    Ref<FileAccess> f = FileAccess::open(path, FileAccess::READ);
+    if (f.is_valid()) {
+        const int64_t MAX_PREVIEW_BYTES = 64 * 1024; // 64 KiB preview
+        int64_t file_len = f->get_length();
+        int64_t to_read = file_len < MAX_PREVIEW_BYTES ? file_len : MAX_PREVIEW_BYTES;
+        PackedByteArray bytes;
+        bytes.resize(to_read);
+        int64_t read = f->get_buffer(bytes.ptrw(), to_read);
+        f->close();
+        String preview = String::utf8((const char *)bytes.ptr(), (int)read);
+        result["success"] = true;
+        result["content"] = preview + (file_len > to_read ? String("\n\n…\n[Truncated preview. Use read_file_advanced with start_line/end_line to fetch specific sections.]") : String());
+        result["truncated"] = file_len > to_read;
+        return result;
+    }
+
+    // If fallback also fails, report the original error
+    result["success"] = false;
+    result["message"] = "Failed to read file: " + path;
+    return result;
 }
 
 Dictionary EditorTools::read_file_advanced(const Dictionary &p_args) {
@@ -1213,16 +1422,14 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
         return result;
     }
     
-    // Read the file content
+    // Read the file content (treat missing file as empty to allow creation)
     Error err;
     String file_content = FileAccess::get_file_as_string(path, &err);
+    bool file_missing = false;
     if (err != OK) {
-        Dictionary result;
-        result["success"] = false;
-        result["message"] = "Failed to read file: " + path;
-        result["diff"] = "";
-        result["compilation_errors"] = Array();
-        return result;
+        file_missing = true;
+        file_content = ""; // create new file from scratch
+        print_line("APPLY_EDIT: Target file does not exist; will create new file: " + path);
     }
     
     // Use OS system call to bypass Godot's broken HTTPClient
@@ -1310,82 +1517,26 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
     if (local_result.get("success", false)) {
         String new_content = local_result["edited_content"];
         String cleaned_content = _clean_backend_content(new_content);
-        
-        print_line("APPLY_EDIT DEBUG: Applying dynamic file approach - writing content to disk immediately");
-        
-        // Generate unified diff with safety checks
+
+        // Generate a lightweight diff summary (UI will show proper diff using original/edited content)
         String diff = "";
-        print_line("APPLY_EDIT DEBUG: About to generate diff...");
-        
-        // Add length checks to prevent huge diffs from hanging
         if (file_content.length() > 100000 || cleaned_content.length() > 100000) {
-            print_line("APPLY_EDIT WARNING: File too large for diff generation, skipping");
             diff = "Diff skipped - file too large (original: " + String::num_int64(file_content.length()) + " chars, new: " + String::num_int64(cleaned_content.length()) + " chars)";
         } else {
-            print_line("APPLY_EDIT DEBUG: Calling _generate_unified_diff with " + String::num_int64(file_content.length()) + " and " + String::num_int64(cleaned_content.length()) + " chars");
-            
-            // TEMPORARY: Skip actual diff generation to test if it's causing hangs
-            // diff = _generate_unified_diff(file_content, cleaned_content, path);
             diff = "=== TEMPORARY SIMPLE DIFF ===\nOriginal length: " + String::num_int64(file_content.length()) + " chars\nNew length: " + String::num_int64(cleaned_content.length()) + " chars\n=== END DIFF ===";
-            
-            print_line("APPLY_EDIT DEBUG: Using temporary simple diff (bypassing _generate_unified_diff)");
         }
-        
-        print_line("APPLY_EDIT DEBUG: Generated diff (" + String::num_int64(diff.length()) + " chars):");
-        if (diff.length() > 0) {
-            print_line("DIFF PREVIEW: " + diff.substr(0, 300) + (diff.length() > 300 ? "..." : ""));
-        } else {
-            print_line("DIFF WARNING: Diff is empty!");
-        }
-        
-        // DYNAMIC APPROACH: Write the new content to disk immediately
-        // This allows Godot to naturally detect compilation errors
-        Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
-        if (file.is_valid()) {
-            file->store_string(cleaned_content);
-            file->close();
-            print_line("APPLY_EDIT: New content written to disk - " + path);
-            print_line("APPLY_EDIT: Godot will now naturally detect any compilation errors");
-        } else {
-            print_line("APPLY_EDIT ERROR: Failed to write to disk - " + path);
-        }
-        
-        // For now, return empty compilation_errors since Godot will show them in the console
-        // In the future, we could capture these from Godot's error system
-        Array compilation_errors;
-        
-        // Apply to script editor for user review
-        ScriptEditor *script_editor = ScriptEditor::get_singleton();
-        if (script_editor) {
-            Ref<Resource> resource = ResourceLoader::load(path);
-            Ref<Script> script = resource;
-            
-            if (script.is_valid()) {
-                script_editor->edit(script);
-                ScriptTextEditor *ste = Object::cast_to<ScriptTextEditor>(script_editor->get_current_editor());
-                if (ste) {
-                    ste->set_diff(file_content, cleaned_content);
-                    print_line("APPLY_EDIT: Diff view ready for user review");
-                }
-            }
-        }
-        
-        // Return enhanced result with diff and compilation errors
+
+        // Do NOT write to disk here. Leave Accept/Reject to the UI layer.
         Dictionary result;
         result["success"] = true;
-        result["message"] = "Changes applied to disk! Use Accept to keep or Reject to revert. Check console for any compilation errors.";
+        result["message"] = file_missing ? String("File does not exist; preview created. Use Accept/Reject to apply.") : String("Preview created. Use Accept/Reject to apply.");
+        result["path"] = path;
+        result["original_content"] = file_content;
         result["edited_content"] = cleaned_content;
         result["diff"] = diff;
-        result["compilation_errors"] = compilation_errors;
-        result["has_errors"] = compilation_errors.size() > 0;
-        result["dynamic_approach"] = true; // Flag to indicate content is already on disk
-        
-        print_line("APPLY_EDIT DEBUG: Final JSON response contains:");
-        print_line("  - success: " + String(result["success"]));
-        print_line("  - diff length: " + String::num_int64(String(result["diff"]).length()));
-        print_line("  - compilation_errors count: " + String::num_int64(Array(result["compilation_errors"]).size()));
-        print_line("  - has_errors: " + String(result["has_errors"]));
-        
+        result["compilation_errors"] = Array();
+        result["has_errors"] = false;
+        result["dynamic_approach"] = false;
         return result;
     }
     
@@ -2359,3 +2510,631 @@ Dictionary EditorTools::search_across_project(const Dictionary &p_args) {
 	
 	return result;
 } 
+
+// --- Multiplexed editor introspection/debug tool ---
+Dictionary EditorTools::editor_introspect(const Dictionary &p_args) {
+    Dictionary result;
+    String operation = p_args.get("operation", "");
+    if (operation.is_empty()) {
+        result["success"] = false;
+        result["message"] = "Missing 'operation'";
+        return result;
+    }
+
+    // Common helpers
+    auto require_path = [&](Dictionary &r) -> Node * {
+        if (!p_args.has("path")) {
+            r["success"] = false;
+            r["message"] = "Missing 'path'";
+            return nullptr;
+        }
+        Dictionary err;
+        Node *node = _get_node_from_path(p_args["path"], err);
+        if (!node) {
+            r = err;
+            return nullptr;
+        }
+        return node;
+    };
+
+    if (operation == "list_node_signals") {
+        Node *node = require_path(result);
+        if (!node) return result;
+
+        List<MethodInfo> signals;
+        node->get_signal_list(&signals);
+
+        Array out_signals;
+        for (const MethodInfo &mi : signals) {
+            Dictionary s;
+            s["name"] = String(mi.name);
+            Array args_arr;
+#ifdef TOOLS_ENABLED
+            // MethodInfo::arguments is available in Godot 4
+            for (int i = 0; i < mi.arguments.size(); i++) {
+                const PropertyInfo &pi = mi.arguments[i];
+                Dictionary a;
+                a["name"] = String(pi.name);
+                a["type"] = Variant::get_type_name(pi.type);
+                args_arr.push_back(a);
+            }
+#endif
+            s["args"] = args_arr;
+            out_signals.push_back(s);
+        }
+
+        result["success"] = true;
+        result["signals"] = out_signals;
+        return result;
+    }
+
+    if (operation == "list_signal_connections") {
+        Node *node = require_path(result);
+        if (!node) return result;
+
+        StringName filter_signal = p_args.get("signal_name", StringName());
+        Array out_conns;
+
+        auto append_connections = [&](const StringName &sig_name) {
+            List<Object::Connection> conns;
+            node->get_signal_connection_list(sig_name, &conns);
+            for (const Object::Connection &conn : conns) {
+                Dictionary c;
+                // Prefer reported signal name if available, else use current loop name
+                StringName sname = sig_name;
+                // In Godot 4, Connection has .signal with get_name()
+                c["signal"] = String(sname);
+                c["method"] = String(conn.callable.get_method());
+                c["flags"] = conn.flags;
+                Object *tobj = conn.callable.get_object();
+                Node *tnode = Object::cast_to<Node>(tobj);
+                if (tnode) {
+                    Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+                    c["target_path"] = root ? root->get_path_to(tnode) : tnode->get_path();
+                    c["target_type"] = tnode->get_class();
+                }
+                out_conns.push_back(c);
+            }
+        };
+
+        if (String(filter_signal).is_empty()) {
+            // No filter: iterate all signals on node
+            List<MethodInfo> signals;
+            node->get_signal_list(&signals);
+            for (const MethodInfo &mi : signals) {
+                append_connections(mi.name);
+            }
+        } else {
+            append_connections(filter_signal);
+        }
+
+        result["success"] = true;
+        result["connections"] = out_conns;
+        return result;
+    }
+
+    if (operation == "list_incoming_connections") {
+        Node *node = require_path(result);
+        if (!node) return result;
+
+        List<Object::Connection> incoming;
+        node->get_signals_connected_to_this(&incoming);
+        Array out_incoming;
+        for (const Object::Connection &conn : incoming) {
+            Dictionary c;
+            // Source object emitting the signal
+            Object *src_obj = nullptr;
+            // In Godot 4, Connection stores the source signal object
+            // This accessor name may vary, so guard
+            src_obj = conn.signal.get_object();
+            Node *src_node = Object::cast_to<Node>(src_obj);
+            if (src_node) {
+                Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+                c["source_path"] = root ? root->get_path_to(src_node) : src_node->get_path();
+                c["source_type"] = src_node->get_class();
+            }
+            c["signal"] = String(conn.signal.get_name());
+            c["method"] = String(conn.callable.get_method());
+            c["flags"] = conn.flags;
+            out_incoming.push_back(c);
+        }
+        result["success"] = true;
+        result["incoming_connections"] = out_incoming;
+        return result;
+    }
+
+    if (operation == "validate_signal_connection") {
+        // More tolerant: accept aliases, infer when missing.
+        Dictionary err;
+        String source_path = p_args.get("source_path", p_args.get("path", String("")));
+        String target_path = p_args.get("target_path", String(""));
+        StringName sig = p_args.has("signal") ? (StringName)p_args["signal"] : (StringName)p_args.get("signal_name", StringName());
+        StringName method = p_args.get("method", StringName());
+
+        Node *source = nullptr;
+        if (!source_path.is_empty()) source = _get_node_from_path(source_path, err);
+        if (!source) return err;
+
+        // If signal missing, attempt heuristic selection
+        if (String(sig).is_empty()) {
+            List<MethodInfo> sigs; source->get_signal_list(&sigs);
+            // Prefer common gameplay signals if present
+            StringName preferred;
+            for (const MethodInfo &mi : sigs) { if (String(mi.name) == "hit") { preferred = mi.name; break; } }
+            if (String(preferred).is_empty() && !sigs.is_empty()) preferred = sigs.front()->get().name;
+            sig = preferred;
+        }
+
+        Node *target = nullptr;
+        if (!target_path.is_empty()) {
+            target = _get_node_from_path(target_path, err);
+            if (!target) return err;
+        }
+
+        // If target or method missing, try inferring from existing connections
+        List<Object::Connection> conns; source->get_signal_connection_list(sig, &conns);
+        if (!target && method == StringName() && conns.size() == 1) {
+            const Object::Connection &c = conns.front()->get();
+            target = Object::cast_to<Node>(c.callable.get_object());
+            method = c.callable.get_method();
+        } else {
+            if (!target && method != StringName()) {
+                // Find unique node having this method
+                Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+                int found = 0; Node *found_node = nullptr;
+                std::function<void(Node*)> dfs = [&](Node *n){ if (!n) return; if (n->has_method(method)) { found++; found_node = n; } for (int i=0;i<n->get_child_count();i++) dfs(n->get_child(i)); };
+                dfs(root);
+                if (found == 1) target = found_node;
+            }
+            if (target && method == StringName()) {
+                // Try Godot's conventional method name
+                String m = String("_on_") + String(source->get_name()) + String("_") + String(sig);
+                if (target->has_method(m)) method = StringName(m);
+                else if (conns.size() == 1) method = conns.front()->get().callable.get_method();
+            }
+        }
+
+        if (!target || method == StringName()) {
+            result["success"] = false;
+            result["message"] = "Could not infer target/method for validation";
+            return result;
+        }
+
+        bool exists = false;
+        for (const Object::Connection &conn : conns) {
+            if (conn.callable.get_method() == method && conn.callable.get_object() == target) { exists = true; break; }
+        }
+        result["success"] = true;
+        result["exists"] = exists;
+        result["source_path"] = source_path;
+        result["signal"] = String(sig);
+        result["target_path"] = EditorNode::get_singleton()->get_tree()->get_edited_scene_root()->get_path_to(target);
+        result["method"] = String(method);
+        return result;
+    }
+
+    if (operation == "connect_signal") {
+        Dictionary err;
+        String source_path = p_args.get("source_path", p_args.get("path", String("")));
+        String target_path = p_args.get("target_path", String(""));
+        StringName sig = p_args.has("signal") ? (StringName)p_args["signal"] : (StringName)p_args.get("signal_name", StringName());
+        StringName method = p_args.get("method", StringName());
+        int flags = p_args.get("flags", 0);
+
+        Node *source = nullptr;
+        if (!source_path.is_empty()) source = _get_node_from_path(source_path, err);
+        if (!source) return err;
+
+        if (String(sig).is_empty()) {
+            // Heuristic: prefer 'hit', else first signal
+            List<MethodInfo> sigs; source->get_signal_list(&sigs);
+            for (const MethodInfo &mi : sigs) { if (String(mi.name) == "hit") { sig = mi.name; break; } }
+            if (String(sig).is_empty() && !sigs.is_empty()) sig = sigs.front()->get().name;
+        }
+
+        Node *target = nullptr;
+        if (!target_path.is_empty()) target = _get_node_from_path(target_path, err);
+        if (!target && method != StringName()) {
+            // Infer target via method search
+            Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+            int found = 0; Node *found_node = nullptr;
+            std::function<void(Node*)> dfs = [&](Node *n){ if (!n) return; if (n->has_method(method)) { found++; found_node = n; } for (int i=0;i<n->get_child_count();i++) dfs(n->get_child(i)); };
+            dfs(root);
+            if (found == 1) target = found_node;
+        }
+        if (target && method == StringName()) {
+            String m = String("_on_") + String(source->get_name()) + String("_") + String(sig);
+            if (target->has_method(m)) method = StringName(m);
+        }
+
+        if (!target || method == StringName()) {
+            result["success"] = false;
+            result["message"] = "Could not infer target/method for connect";
+            return result;
+        }
+
+        Error e = source->connect(sig, Callable(target, method), flags);
+        if (e != OK) {
+            result["success"] = false;
+            result["message"] = String("Failed to connect signal (code ") + itos(e) + ")";
+            return result;
+        }
+        result["success"] = true;
+        result["message"] = "Signal connected";
+        return result;
+    }
+
+    if (operation == "disconnect_signal") {
+        Dictionary err;
+        String source_path = p_args.get("source_path", p_args.get("path", String("")));
+        String target_path = p_args.get("target_path", String(""));
+        StringName sig = p_args.has("signal") ? (StringName)p_args["signal"] : (StringName)p_args.get("signal_name", StringName());
+        StringName method = p_args.get("method", StringName());
+
+        Node *source = nullptr;
+        if (!source_path.is_empty()) source = _get_node_from_path(source_path, err);
+        if (!source) return err;
+
+        // Infer from existing connections if needed
+        if (String(sig).is_empty() || target_path.is_empty() || method == StringName()) {
+            List<Object::Connection> conns; source->get_signal_connection_list(sig, &conns);
+            if (String(sig).is_empty()) {
+                // If no signal specified, try when exactly one connected signal exists
+                List<MethodInfo> sigs; source->get_signal_list(&sigs);
+                for (const MethodInfo &mi : sigs) {
+                    List<Object::Connection> tmp; source->get_signal_connection_list(mi.name, &tmp);
+                    if (tmp.size() == 1) { sig = mi.name; conns = tmp; break; }
+                }
+            }
+            if (conns.size() == 1 && (target_path.is_empty() || method == StringName())) {
+                const Object::Connection &c = conns.front()->get();
+                Node *t = Object::cast_to<Node>(c.callable.get_object());
+                if (target_path.is_empty() && t) {
+                    Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+                    target_path = root ? String(root->get_path_to(t)) : String(t->get_path());
+                }
+                if (method == StringName()) method = c.callable.get_method();
+            }
+        }
+
+        Node *target = nullptr;
+        if (!target_path.is_empty()) target = _get_node_from_path(target_path, err);
+        if (!target || String(sig).is_empty() || method == StringName()) {
+            result["success"] = false;
+            result["message"] = "Could not infer enough info to disconnect";
+            return result;
+        }
+
+        source->disconnect(sig, Callable(target, method));
+        result["success"] = true;
+        result["message"] = "Signal disconnected (if existed)";
+        return result;
+    }
+
+    if (operation == "stop_scene") {
+        EditorRunBar::get_singleton()->stop_playing();
+        result["success"] = true;
+        result["message"] = "Stopped running scene";
+        return result;
+    }
+
+    if (operation == "set_property") {
+        // Reuse set_node_property
+        if (!p_args.has("path") || !p_args.has("property") || !p_args.has("value")) {
+            result["success"] = false;
+            result["message"] = "Missing 'path', 'property', or 'value'";
+            return result;
+        }
+        return set_node_property(p_args);
+    }
+
+    if (operation == "call_method") {
+        // Reuse call_node_method
+        if (!p_args.has("path") || !p_args.has("method")) {
+            result["success"] = false;
+            result["message"] = "Missing 'path' or 'method'";
+            return result;
+        }
+        return call_node_method(p_args);
+    }
+
+    if (operation == "start_signal_trace") {
+        // args: node_paths[], signals?, include_args?, max_events?
+        Array node_paths = p_args.get("node_paths", Array());
+        Array signals = p_args.get("signals", Array());
+        bool include_args = p_args.get("include_args", false);
+        int max_events = p_args.get("max_events", 100);
+
+        if (node_paths.is_empty()) {
+            result["success"] = false;
+            result["message"] = "node_paths required";
+            return result;
+        }
+
+        String trace_id = String::num_uint64((uint64_t)OS::get_singleton()->get_ticks_usec());
+        Dictionary reg;
+        reg["events"] = Array();
+        reg["include_args"] = include_args;
+        reg["max_events"] = max_events;
+        reg["next_index"] = 0;
+        Array connections; // store for cleanup
+
+        Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+        EditorTools *tracer = ensure_tracer();
+        for (int i = 0; i < node_paths.size(); i++) {
+            String np = node_paths[i];
+            Dictionary err;
+            Node *src = _get_node_from_path(np, err);
+            if (!src) continue;
+
+            // signals empty => connect all signals from node
+            List<MethodInfo> sigs;
+            src->get_signal_list(&sigs);
+            for (const MethodInfo &mi : sigs) {
+                if (!signals.is_empty()) {
+                    bool match = false;
+                    for (int s = 0; s < signals.size(); s++) {
+                        if (String(mi.name) == String(signals[s])) { match = true; break; }
+                    }
+                    if (!match) continue;
+                }
+                // Connect to callback on tracer instance
+        		String src_path_str = root ? String(root->get_path_to(src)) : String(src->get_path());
+                int argc = mi.arguments.size();
+                Callable cb;
+                switch (MIN(argc, 4)) {
+                    case 0: cb = callable_mp(tracer, &EditorTools::_on_traced_signal_0).bind(trace_id, src_path_str, String(mi.name)); break;
+                    case 1: cb = callable_mp(tracer, &EditorTools::_on_traced_signal_1).bind(trace_id, src_path_str, String(mi.name)); break;
+                    case 2: cb = callable_mp(tracer, &EditorTools::_on_traced_signal_2).bind(trace_id, src_path_str, String(mi.name)); break;
+                    case 3: cb = callable_mp(tracer, &EditorTools::_on_traced_signal_3).bind(trace_id, src_path_str, String(mi.name)); break;
+                    default: cb = callable_mp(tracer, &EditorTools::_on_traced_signal_4).bind(trace_id, src_path_str, String(mi.name)); break;
+                }
+                Error e = src->connect(mi.name, cb);
+                if (e == OK) {
+                    Dictionary c;
+                    c["node_path"] = src_path_str;
+                    c["signal"] = String(mi.name);
+                    c["callable"] = cb; // store callable to disconnect precisely
+                    connections.push_back(c);
+                }
+            }
+        }
+
+        reg["connections"] = connections;
+        trace_registry[trace_id] = reg;
+        result["success"] = true;
+        result["trace_id"] = trace_id;
+        result["connected"] = connections.size();
+        return result;
+    }
+
+    if (operation == "stop_signal_trace") {
+        String trace_id = p_args.get("trace_id", "");
+        if (!trace_registry.has(trace_id)) {
+            result["success"] = false;
+            result["message"] = "Unknown trace_id";
+            return result;
+        }
+        Dictionary reg = trace_registry[trace_id];
+        Array connections = reg.get("connections", Array());
+        Node *root = EditorNode::get_singleton()->get_tree()->get_edited_scene_root();
+        for (int i = 0; i < connections.size(); i++) {
+            Dictionary c = connections[i];
+            Dictionary err;
+            Node *src = _get_node_from_path(c.get("node_path", ""), err);
+            if (!src) continue;
+            StringName sig = c.get("signal", "");
+            Variant callable_v = c.get("callable", Variant());
+            if (callable_v.get_type() == Variant::CALLABLE) {
+                Callable cb = callable_v;
+                src->disconnect(sig, cb);
+            }
+        }
+        trace_registry.erase(trace_id);
+        result["success"] = true;
+        result["message"] = "Trace stopped";
+        return result;
+    }
+
+    if (operation == "get_trace_events") {
+        String trace_id = p_args.get("trace_id", "");
+        int since = p_args.get("since_index", 0);
+        if (!trace_registry.has(trace_id)) {
+            result["success"] = false;
+            result["message"] = "Unknown trace_id";
+            return result;
+        }
+        Dictionary reg = trace_registry[trace_id];
+        Array events = reg.get("events", Array());
+        Array out;
+        for (int i = 0; i < events.size(); i++) {
+            Dictionary e = events[i];
+            if ((int)e.get("i", 0) >= since) out.push_back(e);
+        }
+        result["success"] = true;
+        result["events"] = out;
+        result["next_index"] = reg.get("next_index", 0);
+        return result;
+    }
+
+    if (operation == "start_property_watch") {
+        // variables[], node_path, max_events?
+        Array variables = p_args.get("variables", Array());
+        String node_path = p_args.get("node_path", String("."));
+        int max_events = p_args.get("max_events", 200);
+        if (variables.is_empty()) {
+            result["success"] = false;
+            result["message"] = "variables required";
+            return result;
+        }
+        Dictionary err; Node *node = _get_node_from_path(node_path, err);
+        if (!node) return err;
+
+        String watch_id = String::num_uint64((uint64_t)OS::get_singleton()->get_ticks_usec());
+        Dictionary reg;
+        reg["node_path"] = node_path;
+        reg["variables"] = variables;
+        reg["last_values"] = Dictionary();
+        reg["events"] = Array();
+        reg["next_index"] = 0;
+        reg["max_events"] = max_events;
+        property_watch_registry[watch_id] = reg;
+
+        // Initial snapshot
+        Dictionary ev;
+        ev["i"] = 0;
+        ev["time_ms"] = OS::get_singleton()->get_ticks_msec();
+        ev["snapshot"] = Dictionary();
+        Dictionary snap;
+        for (int i = 0; i < variables.size(); i++) {
+            String v = variables[i];
+            snap[v] = node->get(v);
+        }
+        ev["snapshot"] = snap;
+        Array events = reg["events"]; events.push_back(ev);
+        reg["events"] = events; reg["next_index"] = 1;
+        reg["last_values"] = snap;
+        property_watch_registry[watch_id] = reg;
+
+        result["success"] = true;
+        result["watch_id"] = watch_id;
+        return result;
+    }
+
+    if (operation == "poll_property_watch") {
+        String watch_id = p_args.get("watch_id", "");
+        int since = p_args.get("since_index", 0);
+        if (!property_watch_registry.has(watch_id)) {
+            result["success"] = false;
+            result["message"] = "Unknown watch_id";
+            return result;
+        }
+        Dictionary reg = property_watch_registry[watch_id];
+        String node_path = reg.get("node_path", String("."));
+        Array variables = reg.get("variables", Array());
+        Dictionary last = reg.get("last_values", Dictionary());
+        Array events = reg.get("events", Array());
+        int next_index = reg.get("next_index", 0);
+        int max_events = reg.get("max_events", 200);
+
+        Dictionary err; Node *node = _get_node_from_path(node_path, err);
+        if (!node) return err;
+
+        bool changed = false; Dictionary delta;
+        for (int i = 0; i < variables.size(); i++) {
+            String v = variables[i];
+            Variant value = node->get(v);
+            Variant last_v = last.get(v, Variant());
+            if (value != last_v) {
+                delta[v] = value; last[v] = value; changed = true;
+            }
+        }
+        if (changed) {
+            Dictionary ev;
+            ev["i"] = next_index;
+            ev["time_ms"] = OS::get_singleton()->get_ticks_msec();
+            ev["delta"] = delta;
+            events.push_back(ev);
+            while (events.size() > max_events) events.remove_at(0);
+            next_index += 1;
+        }
+        reg["events"] = events; reg["next_index"] = next_index; reg["last_values"] = last;
+        property_watch_registry[watch_id] = reg;
+
+        Array out;
+        for (int i = 0; i < events.size(); i++) { Dictionary e = events[i]; if ((int)e.get("i", 0) >= since) out.push_back(e); }
+        result["success"] = true;
+        result["events"] = out;
+        result["next_index"] = next_index;
+        return result;
+    }
+
+    if (operation == "stop_property_watch") {
+        String watch_id = p_args.get("watch_id", "");
+        property_watch_registry.erase(watch_id);
+        result["success"] = true;
+        result["message"] = "Property watch stopped";
+        return result;
+    }
+
+    if (operation == "simulate_interaction") {
+        // Minimal scripted steps: e.g., "call:Player._on_Player_hit(); wait:500; set:Main.health=2"
+        String script = p_args.get("interaction_script", String(""));
+        String base = p_args.get("node_path", String("."));
+        if (script.is_empty()) {
+            result["success"] = false;
+            result["message"] = "interaction_script required";
+            return result;
+        }
+        Dictionary err; Node *root = _get_node_from_path(base, err);
+        if (!root) return err;
+        Vector<String> steps = script.split(";");
+        for (int i = 0; i < steps.size(); i++) {
+            String s = steps[i].strip_edges();
+            if (s.is_empty()) continue;
+            if (s.begins_with("wait:")) {
+                int ms = s.substr(5).to_int();
+                OS::get_singleton()->delay_usec((uint64_t)ms * 1000);
+                continue;
+            }
+            if (s.begins_with("set:")) {
+                String expr = s.substr(4); // Node.property=value
+                int eq = expr.find("=");
+                if (eq > 0) {
+                    String lhs = expr.substr(0, eq).strip_edges();
+                    String rhs = expr.substr(eq + 1).strip_edges();
+                    int dot = lhs.find(".");
+                    if (dot > 0) {
+                        String node_rel = lhs.substr(0, dot);
+                        String prop = lhs.substr(dot + 1);
+                        Dictionary e2; Node *n = _get_node_from_path(node_rel, e2);
+                        if (n) { n->set(prop, rhs); }
+                    }
+                }
+                continue;
+            }
+            if (s.begins_with("call:")) {
+                String call = s.substr(5); // Node.method(args?)
+                int dot = call.find("."); int par = call.find("("); int par2 = call.rfind(")");
+                if (dot > 0 && par > dot && par2 > par) {
+                    String node_rel = call.substr(0, dot);
+                    String method = call.substr(dot + 1, par - (dot + 1));
+                    String args_str = call.substr(par + 1, par2 - par - 1);
+                    Array args;
+                    if (!args_str.is_empty()) { Vector<String> parts = args_str.split(","); for (int j=0;j<parts.size();j++) args.push_back(parts[j].strip_edges()); }
+                    Dictionary e2; Node *n = _get_node_from_path(node_rel, e2); if (n) { n->callv(method, args); }
+                }
+                continue;
+            }
+        }
+        result["success"] = true;
+        result["message"] = "Simulation completed";
+        return result;
+    }
+
+    // Minimal stub to keep calls safe; expand with concrete implementations as needed.
+    if (operation == "rename_node") {
+        if (!p_args.has("path") || !p_args.has("new_name")) {
+            result["success"] = false;
+            result["message"] = "Missing 'path' or 'new_name'";
+            return result;
+        }
+        Dictionary err;
+        Node *node = _get_node_from_path(p_args["path"], err);
+        if (!node) {
+            return err;
+        }
+        String new_name = p_args["new_name"];
+        node->set_name(new_name);
+        result["success"] = true;
+        result["message"] = "Node renamed";
+        result["path"] = p_args["path"];
+        result["new_name"] = new_name;
+        return result;
+    }
+
+    // Signals and trace operations not yet implemented in this stub.
+    result["success"] = false;
+    result["message"] = String("Operation not implemented: ") + operation;
+    return result;
+}

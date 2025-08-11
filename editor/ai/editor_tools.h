@@ -12,6 +12,18 @@ class EditorTools : public Object {
 private:
 	static Dictionary _get_node_info(Node *p_node);
 	static Node *_get_node_from_path(const String &p_path, Dictionary &r_error_result);
+    // Trace support
+    static EditorTools *tracer_instance;
+    static Dictionary trace_registry; // trace_id -> { events:Array, connections:Array, include_args:bool, max_events:int, next_index:int }
+    static Dictionary property_watch_registry; // watch_id -> { node_path:String, variables:Array, last_values:Dictionary, events:Array, next_index:int, max_events:int }
+    static EditorTools *ensure_tracer();
+    static void _record_trace_event(const String &p_trace_id, const String &p_source_path, const String &p_signal_name, const Array &p_args);
+    // Signal trace callbacks for 0..4 signal-args; bound extras follow after signal args
+    void _on_traced_signal_0(const String &p_trace_id, const String &p_source_path, const String &p_signal_name);
+    void _on_traced_signal_1(const Variant &a0, const String &p_trace_id, const String &p_source_path, const String &p_signal_name);
+    void _on_traced_signal_2(const Variant &a0, const Variant &a1, const String &p_trace_id, const String &p_source_path, const String &p_signal_name);
+    void _on_traced_signal_3(const Variant &a0, const Variant &a1, const Variant &a2, const String &p_trace_id, const String &p_source_path, const String &p_signal_name);
+    void _on_traced_signal_4(const Variant &a0, const Variant &a1, const Variant &a2, const Variant &a3, const String &p_trace_id, const String &p_source_path, const String &p_signal_name);
 
 public:
     static Dictionary _predict_code_edit(const String &p_file_content, const String &p_prompt, const String &p_api_endpoint);
@@ -42,6 +54,7 @@ public:
 	static Dictionary add_collision_shape(const Dictionary &p_args);
 	static Dictionary generalnodeeditor(const Dictionary &p_args);
 	static Dictionary list_project_files(const Dictionary &p_args);
+	static Dictionary search_project_files(const Dictionary &p_args);
 	static Dictionary read_file_content(const Dictionary &p_args);
 	static Dictionary read_file_advanced(const Dictionary &p_args);
 	static Dictionary apply_edit(const Dictionary &p_args);
@@ -62,4 +75,7 @@ public:
 	static Dictionary universal_node_manager(const Dictionary &p_args);
 	static Dictionary universal_file_manager(const Dictionary &p_args);
 	static Dictionary scene_manager(const Dictionary &p_args);
+
+	// Multiplexed introspection/debug tool
+	static Dictionary editor_introspect(const Dictionary &p_args);
 }; 

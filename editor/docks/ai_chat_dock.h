@@ -126,11 +126,16 @@ private:
 		Vector<ChatMessage> messages;
 	};
 
+	// Attachment safety limits to protect model context
+	static const int64_t MAX_TEXT_ATTACHMENT_PREVIEW_BYTES = 64 * 1024; // Read at most 64 KiB from disk
+	static const int MAX_TEXT_ATTACHMENT_PREVIEW_CHARS = 20000; // And cap decoded text length
+
 	ScrollContainer *chat_scroll = nullptr;
 	VBoxContainer *chat_container = nullptr;
 	OptionButton *model_dropdown = nullptr;
 	OptionButton *conversation_history_dropdown = nullptr;
 	Button *new_conversation_button = nullptr;
+	Button *index_button = nullptr;
 	TextEdit *input_field = nullptr;
 	Button *send_button = nullptr;
 	Button *stop_button = nullptr;
@@ -144,6 +149,14 @@ private:
 	HTTPRequest *embedding_request = nullptr;
 	bool embedding_system_initialized = false;
 	bool initial_indexing_done = false;
+	bool embedding_request_busy = false;
+	// Embedding progress UI
+	Label *embedding_status_label = nullptr;
+	Timer *embedding_status_timer = nullptr;
+	bool embedding_in_progress = false;
+	int embedding_status_dots = 0;
+	String embedding_status_base;
+	Dictionary current_batch_info;
 
 	// User authentication
 	HTTPRequest *auth_request = nullptr;
@@ -202,7 +215,9 @@ private:
 	Vector<AttachedFile> current_attached_files;
 	String conversations_file_path;
 	String api_key;
-	String api_endpoint = "https://gamechat.simplifine.com/chat";
+    // Use local backend during development; switch to cloud URL for production
+	//     String api_endpoint = "https://gamechat.simplifine.com/chat";
+    String api_endpoint = "http://127.0.0.1:8000/chat";
 	String model = "gpt-4o";
 
 	bool is_waiting_for_response = false;
@@ -236,6 +251,7 @@ private:
 	void _populate_tree_recursive(EditorFileSystemDirectory *p_dir, TreeItem *p_parent, const String &p_filter);
 	void _on_at_mention_item_selected();
 	void _on_model_selected(int p_index);
+	void _on_index_button_pressed();
 	void _on_tool_output_toggled(Control *p_content);
 	void _on_attachment_menu_item_pressed(int p_id);
 	void _on_attach_files_pressed();
@@ -274,6 +290,9 @@ private:
 	void _clear_attachments();
 	String _get_timestamp();
 	void _scroll_to_bottom();
+
+	// Helper to truncate overly large text before sending to the model
+	String _truncate_text_for_context(const String &p_text, int p_max_chars = MAX_TEXT_ATTACHMENT_PREVIEW_CHARS);
 
 	// Conversation management
 	void _load_conversations();
@@ -354,7 +373,17 @@ private:
 	void _on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	bool _should_index_file(const String &p_file_path);
 	String _get_project_root_path();
+	String _get_embed_base_url();
+	void _set_embedding_status(const String &p_text, bool p_busy);
+	void _on_embedding_status_tick();
 
+	// Cloud-ready file indexing methods
+	void _scan_and_index_project_files();
+	void _scan_directory_recursive(const String &p_dir_path, const String &p_project_root, Array &p_file_contents, int &p_files_processed, int &p_files_skipped);
+	Dictionary _read_file_for_indexing(const String &p_file_path, const String &p_project_root);
+	String _calculate_content_hash(const String &p_content);
+	void _send_file_batch(const Array &p_all_files, int p_start_index, int p_batch_size, int p_current_batch, int p_total_batches);
+	
 	// Smart context attachment based on embeddings
 	void _suggest_relevant_files(const String &p_query);
 	void _auto_attach_relevant_context();

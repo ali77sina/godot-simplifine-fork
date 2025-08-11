@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, jsonify, redirect, session
+from flask import Flask, request, Response, jsonify, redirect, session, stream_with_context
 import openai
 import json
 import os
@@ -11,7 +11,8 @@ from threading import Lock
 import uuid
 import time
 import tempfile
-from multimodal_embedding_manager import MultimodalEmbeddingManager
+import hashlib
+from cloud_vector_manager import CloudVectorManager
 from auth_manager import AuthManager
 
 # Load environment variables from .env file
@@ -46,28 +47,30 @@ if not api_key:
 client = openai.OpenAI(api_key=api_key)
 
 # Model configuration
-MODEL = "gpt-4o"  # Using GPT-4o which supports function calling
+MODEL = "gpt-5"  # Using GPT-5 which supports function calling
 
 # Initialize Authentication Manager
 auth_manager = AuthManager()
 
-# Initialize Multimodal Embedding Manager
-GCP_BUCKET_NAME = os.getenv('GCP_BUCKET_NAME', 'godot-ai-embeddings')
+# Initialize Cloud Vector Manager
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
 if not GCP_PROJECT_ID:
     raise ValueError("GCP_PROJECT_ID environment variable is required")
 
-# User-specific embedding managers (cached)
-embedding_managers = {}
+cloud_vector_manager = CloudVectorManager(GCP_PROJECT_ID, client)
 
-def get_embedding_manager(user_id: str, project_root: str):
-    """Get or create user-specific embedding manager instance"""
-    cache_key = f"{user_id}:{project_root}"
-    if cache_key not in embedding_managers:
-        embedding_managers[cache_key] = MultimodalEmbeddingManager(
-            client, GCP_BUCKET_NAME, project_root, user_id, GCP_PROJECT_ID
-        )
-    return embedding_managers[cache_key]
+# Load system prompt from file (once at startup)
+SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), 'system_prompt.txt')
+SYSTEM_PROMPT = None
+try:
+    with open(SYSTEM_PROMPT_PATH, 'r', encoding='utf-8') as f:
+        SYSTEM_PROMPT = f.read().strip()
+        if SYSTEM_PROMPT:
+            print(f"SYSTEM_PROMPT: Loaded ({len(SYSTEM_PROMPT)} chars)")
+        else:
+            print("SYSTEM_PROMPT: File is empty; no system message will be prepended")
+except Exception as e:
+    print(f"SYSTEM_PROMPT: Failed to load: {e}")
 
 def verify_authentication():
     """Verify user authentication from request (with dev mode bypass)"""
@@ -295,18 +298,18 @@ def image_operation_internal(arguments: dict, conversation_messages: list = None
 
 # --- Search Across Project Function ---
 def search_across_project_internal(arguments: dict, current_user: dict = None) -> dict:
-    """Execute search across project using the embedding system"""
+    """Execute search across project using the cloud vector system"""
     try:
         query = arguments.get('query', '')
         if not query:
             return {"success": False, "error": "Query parameter is required"}
         
         # Get parameters
-        include_graph = arguments.get('include_graph', True)
         max_results = arguments.get('max_results', 5)
-        modality_filter = arguments.get('modality_filter')
+        project_root = arguments.get('project_root')
+        project_id = arguments.get('project_id')
         
-        # Get authentication from current request context or use provided user
+        # Get authentication
         if current_user is None:
             user, error_response, status_code = verify_authentication()
             if error_response:
@@ -314,59 +317,48 @@ def search_across_project_internal(arguments: dict, current_user: dict = None) -
         else:
             user = current_user
         
-        # Get project root from arguments or use a default
-        project_root = arguments.get('project_root', '/Users/alikavoosi/Desktop/3d-design/game-from-scratch-project/new-game-project')
+        # Ensure a project_root is present or fall back to environment/CWD (never require request context here)
+        if not project_root:
+            # Try environment variable first, then current working directory
+            project_root = os.getenv('PROJECT_ROOT') or os.getcwd()
         
-        # Get user-specific embedding manager
-        em = get_embedding_manager(user['id'], project_root)
+        if not project_root:
+            return {
+                "success": False,
+                "error": "project_root not provided and no fallback available"
+            }
         
-        if include_graph:
-            # Enhanced search with graph context
-            results = em.search_with_graph_context(query, max_results, include_connected=True)
-            
-            # Format for tool response
-            formatted_results = {
-                "similar_files": [
-                    {
-                        "file_path": path,
-                        "similarity": float(score),
-                        "modality": modality,
-                        "connections": results['connected_files'].get(path, {})
-                    }
-                    for path, score, modality in results['similarity_results']
-                ],
-                "central_files": [
-                    {
-                        "file_path": path,
-                        "centrality": float(score)
-                    }
-                    for path, score in results['central_files']
-                ],
-                "graph_summary": results['graph_summary']
-            }
-        else:
-            # Regular similarity search
-            similarity_results = em.search_similar_files(query, max_results, modality_filter)
-            formatted_results = {
-                "similar_files": [
-                    {
-                        "file_path": path,
-                        "similarity": float(score),
-                        "modality": modality
-                    }
-                    for path, score, modality in similarity_results
-                ],
-                "central_files": [],
-                "graph_summary": {}
-            }
+        # Generate project ID if not provided
+        if not project_id:
+            project_id = hashlib.md5(project_root.encode()).hexdigest()
+        
+        # Search using cloud vector manager
+        results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
+        
+        # Format results
+        formatted_results = {
+            "similar_files": [
+                {
+                    "file_path": r['file_path'],
+                    "similarity": r['similarity'],
+                    "modality": "text",
+                    "chunk_index": r['chunk']['chunk_index'] if r.get('chunk') else 0,
+                    "chunk_start": r['chunk']['start_line'] if r.get('chunk') else None,
+                    "chunk_end": r['chunk']['end_line'] if r.get('chunk') else None,
+                }
+                for r in results
+            ],
+            "central_files": [],
+            "graph_summary": {}
+        }
         
         return {
             "success": True,
             "query": query,
             "results": formatted_results,
-            "include_graph": include_graph,
-            "file_count": len(formatted_results["similar_files"]),
-            "message": f"Found {len(formatted_results['similar_files'])} relevant files for query: {query}"
+            "include_graph": False,
+            "file_count": len(results),
+            "message": f"Found {len(results)} relevant files for query: {query}"
         }
         
     except Exception as e:
@@ -856,105 +848,81 @@ godot_tools = [
     {
         "type": "function",
         "function": {
-            "name": "create_script_file",
-            "description": "Create a new script file with AI-generated content. If no scene is loaded and you get scene errors, use manage_scene tool first to create a new scene.",
+            "name": "editor_introspect",
+            "description": "Signal and scene inspection/manipulation with optional lightweight tracing. Multiplexed tool to keep the surface small.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "operation": {
                         "type": "string",
-                        "description": "File path where to create the script (e.g., 'res://scripts/player.gd')"
+                        "enum": [
+                            "list_node_signals",
+                            "list_signal_connections",
+                            "list_incoming_connections",
+                            "validate_signal_connection",
+                            "connect_signal",
+                            "disconnect_signal",
+                            "rename_node",
+                            "open_connections_dialog",
+                            "start_signal_trace",
+                            "stop_signal_trace",
+                            "get_trace_events"
+                        ],
+                        "description": "Operation to perform"
                     },
-                    "script_type": {
-                        "type": "string",
-                        "description": "Type of script to generate (e.g., 'player_controller', 'enemy_ai', 'weapon_system')"
-                    },
-                    "node_type": {
-                        "type": "string", 
-                        "description": "Target node type (e.g., 'CharacterBody2D', 'RigidBody2D', 'Area2D')"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Detailed description of what the script should do"
-                    }
+                    "path": { "type": "string", "description": "Node path" },
+                    "signal_name": { "type": "string", "description": "Signal name" },
+                    "source_path": { "type": "string", "description": "Source node path (for connect/disconnect/validate)" },
+                    "target_path": { "type": "string", "description": "Target node path" },
+                    "method": { "type": "string", "description": "Target method name" },
+                    "binds": { "type": "array", "items": {}, "description": "Optional bound args" },
+                    "flags": { "type": "integer", "description": "Connect flags (e.g., CONNECT_DEFERRED)" },
+                    "new_name": { "type": "string", "description": "New name for rename_node" },
+                    "node_paths": { "type": "array", "items": { "type": "string" }, "description": "Nodes to trace" },
+                    "signals": { "type": "array", "items": { "type": "string" }, "description": "Signals to trace" },
+                    "include_args": { "type": "boolean", "default": False, "description": "Include args in trace events" },
+                    "max_events": { "type": "integer", "default": 100, "description": "Max buffered events" },
+                    "trace_id": { "type": "string", "description": "Existing trace ID" },
+                    "since_index": { "type": "integer", "description": "Fetch events/logs since index" }
                 },
-                "required": ["path", "script_type", "description"]
+                "required": ["operation"]
             }
         }
     },
-    {
-        "type": "function", 
-        "function": {
-            "name": "delete_file_safe",
-            "description": "Safely delete a file with confirmation",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to delete"
-                    },
-                    "backup": {
-                        "type": "boolean", 
-                        "description": "Whether to create backup before deletion",
-                        "default": True
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file_with_diff",
-            "description": "Edit a file and show before/after diff in results",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to edit"
-                    },
-                    "prompt": {
-                        "type": "string", 
-                        "description": "Description of the edit to apply"
-                    },
-                    "show_full_diff": {
-                        "type": "boolean",
-                        "description": "Whether to show complete file diff or just changes",
-                        "default": False
-                    }
-                },
-                "required": ["path", "prompt"]
-            }
-        }
-    },
+    # Deprecated tools removed: create_script_file, delete_file_safe
     {
         "type": "function",
         "function": {
             "name": "search_across_project",
-            "description": "Search for relevant files across the entire project using semantic similarity and relationship context. Perfect for understanding how systems work, finding related code, or discovering project structure. Includes graph relationships showing how files connect.",
+            "description": "Semantic search across the user's current Godot project. Returns the most relevant files by meaning (not keyword) and can include graph context (connected files and central project files). Use this to locate where behavior is implemented, find related assets, or navigate large projects.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query describing what you're looking for (e.g., 'player movement', 'UI system', 'audio handling')"
-                    },
-                    "include_graph": {
-                        "type": "boolean",
-                        "description": "Include relationship graph context showing how files connect",
-                        "default": True
+                        "description": "Natural-language description of what to find (e.g., 'player movement', 'where damage is applied', 'UI theme resource')."
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of similar files to return",
+                        "description": "Maximum number of results to return (default 5).",
                         "default": 5
+                    },
+                    "include_graph": {
+                        "type": "boolean",
+                        "description": "Include graph context: connected files per result and central files (default true).",
+                        "default": True
                     },
                     "modality_filter": {
                         "type": "string",
-                        "description": "Filter by file type: 'text' (scripts/scenes), 'image', 'audio', or null for all types"
+                        "description": "Optional filter: 'text' (scripts/scenes), 'image', 'audio'."
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Absolute path to the project root. Defaults to active project if omitted."
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Stable project identifier to segregate indexes across machines (optional)."
                     }
                 },
                 "required": ["query"]
@@ -998,6 +966,7 @@ def chat():
     
     data = request.json
     messages = data.get('messages', [])
+    model = data.get('model', MODEL)  # Use requested model or fall back to default
 
     if not messages:
         return jsonify({"error": "No messages provided"}), 400
@@ -1036,6 +1005,13 @@ def chat():
                     yield json.dumps({"status": "stopped", "message": "Request stopped"}) + '\n'
                     return
 
+            # Log incoming headers for project root troubleshooting
+            try:
+                prj_hdr = request.headers.get('X-Project-Root')
+                print(f"CHAT_HEADERS: X-Project-Root={prj_hdr} X-User-ID={request.headers.get('X-User-ID')} X-Machine-ID={request.headers.get('X-Machine-ID')}")
+            except Exception:
+                pass
+
             while True:  # Loop to handle tool calling and responses
                 # Check for stop before each major operation
                 if check_stop():
@@ -1055,6 +1031,8 @@ def chat():
                 
                 # Clean messages for OpenAI (preserve vision content, remove custom fields)
                 openai_messages = []
+                # Only forward tool-role messages if there's a preceding assistant message with tool_calls
+                prior_assistant_with_tools = False
                 for msg in conversation_messages:
                     if msg is None:
                         # print(f"CLEAN_MESSAGES: Skipping None message")
@@ -1063,8 +1041,12 @@ def chat():
                         # print(f"CLEAN_MESSAGES: Skipping non-dict message: {type(msg)}")
                         continue
                         
+                    role = msg['role']
+                    if role == 'tool' and not prior_assistant_with_tools:
+                        # Skip stray tool messages that are not responses to assistant tool_calls
+                        continue
                     clean_msg = {
-                        'role': msg['role'],
+                        'role': role,
                         'content': msg.get('content') # Use .get for safety
                     }
                     # Include standard OpenAI fields
@@ -1079,6 +1061,8 @@ def chat():
                                     fixed_tool_call['type'] = 'function'
                                 fixed_tool_calls.append(fixed_tool_call)
                         clean_msg['tool_calls'] = fixed_tool_calls
+                        if role == 'assistant' and fixed_tool_calls:
+                            prior_assistant_with_tools = True
                     if 'tool_call_id' in msg:
                         clean_msg['tool_call_id'] = msg['tool_call_id']
                     if 'name' in msg:
@@ -1087,6 +1071,11 @@ def chat():
                     # Remove custom frontend fields that may contain large data
                     # Keep only standard OpenAI message format
                     openai_messages.append(clean_msg)
+
+                # Prepend system prompt if available
+                if SYSTEM_PROMPT:
+                    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+                    openai_messages = [system_msg] + openai_messages
                 
                 # Debug: Check total token usage
                 total_chars = sum(len(str(msg.get('content', ''))) for msg in openai_messages)
@@ -1095,7 +1084,7 @@ def chat():
                     print(f"OPENAI_PREP: WARNING - Very large message content ({total_chars} chars), may hit token limits!")
                 
                 response = client.chat.completions.create(
-                    model=MODEL,
+                    model=model,
                     messages=openai_messages,
                     tools=godot_tools,
                     tool_choice="auto",
@@ -1234,12 +1223,36 @@ def chat():
                             
                             yield json.dumps({"tool_starting": "search_across_project", "tool_id": tool_id, "status": "tool_starting"}) + '\n'
                             try:
-                                arguments = json.loads(func["arguments"])
-                            except json.JSONDecodeError:
+                                arguments = json.loads(func["arguments"]) if func.get("arguments") else {}
+                            except Exception:
                                 arguments = {}
+                            # Ensure project_root is provided (fallback to header)
+                            if not arguments.get('project_root'):
+                                hdr_root = request.headers.get('X-Project-Root')
+                                if hdr_root:
+                                    arguments['project_root'] = hdr_root
+                                    print(f"SEARCH_TOOL_FIX: Injected project_root from header: {hdr_root}")
+                                else:
+                                    # As a final fallback, try environment/project cwd
+                                    try:
+                                        cwd_root = os.getenv('PROJECT_ROOT') or os.getcwd()
+                                        arguments['project_root'] = cwd_root
+                                        print(f"SEARCH_TOOL_FIX: Fallback project_root from CWD: {cwd_root}")
+                                    except Exception:
+                                        pass
                             
                             # Execute the search operation (pass current user context)
                             search_result = search_across_project_internal(arguments, current_user=user)
+                            # If search failed due to missing project_root, synthesize a minimal result to satisfy toolcall contract
+                            if not search_result.get('success', False):
+                                msg = search_result.get('error') or search_result.get('message') or 'Search failed'
+                                search_result = {
+                                    'success': False,
+                                    'query': arguments.get('query'),
+                                    'results': {'similar_files': [], 'central_files': [], 'graph_summary': {}},
+                                    'file_count': 0,
+                                    'message': f"search_across_project error: {msg}"
+                                }
                             
                             # Check for stop after tool execution
                             if check_stop():
@@ -1353,7 +1366,8 @@ def chat():
                     del ACTIVE_REQUESTS[request_id]
                     print(f"CLEANUP: Removed request {request_id} from active requests")
 
-    return Response(generate_stream(), mimetype='application/x-ndjson')
+    # Preserve request context during streaming to avoid 'Working outside of request context'.
+    return Response(stream_with_context(generate_stream()), mimetype='application/x-ndjson')
 
 @app.route('/generate_script', methods=['POST'])
 def generate_script():
@@ -1394,7 +1408,7 @@ def generate_script():
     
     try:
         response = client.chat.completions.create(
-            model=MODEL,
+            model=data.get('model', MODEL),
             messages=[{"role": "user", "content": script_prompt}]
         )
         
@@ -1464,7 +1478,7 @@ Original file content:
 Return the complete edited file content (no explanations, just the code):"""
 
         response = client.chat.completions.create(
-            model=MODEL,
+            model=data.get('model', MODEL),
             messages=[
                 {"role": "user", "content": full_prompt}
             ]
@@ -1610,15 +1624,14 @@ def auth_logout():
 @app.route('/embed', methods=['POST'])
 def embed_endpoint():
     """
-    Multimodal embedding endpoint for managing project file embeddings with user authentication
+    Cloud embedding endpoint for managing project file embeddings
     
     Actions:
     - index_project: Index all project files
     - index_file: Index specific file
-    - remove_file: Remove file from index
-    - search: Search for similar files with optional modality filtering
+    - search: Search for similar files
     - status: Get project summary
-    - update_file: Update specific file embedding
+    - clear: Clear project index
     """
     try:
         # Verify authentication
@@ -1629,6 +1642,7 @@ def embed_endpoint():
         data = request.json
         action = data.get('action')
         project_root = data.get('project_root')
+        project_id = data.get('project_id')
         
         if not action:
             return jsonify({"error": "No action specified"}), 400
@@ -1636,16 +1650,18 @@ def embed_endpoint():
         if not project_root:
             return jsonify({"error": "project_root required"}), 400
         
-        # Get user-specific embedding manager
-        em = get_embedding_manager(user['id'], project_root)
+        # Generate project ID if not provided
+        if not project_id:
+            project_id = hashlib.md5(project_root.encode()).hexdigest()
         
         if action == 'index_project':
             force_reindex = data.get('force_reindex', False)
-            stats = em.index_project(force_reindex=force_reindex)
+            stats = cloud_vector_manager.index_project(project_root, user['id'], project_id, force_reindex)
             return jsonify({
                 "success": True,
                 "action": "index_project",
-                "stats": stats
+                "stats": stats,
+                "project_id": project_id
             })
         
         elif action == 'index_file':
@@ -1653,38 +1669,29 @@ def embed_endpoint():
             if not file_path:
                 return jsonify({"error": "file_path required for index_file action"}), 400
             
-            indexed = em.index_file(file_path)
+            indexed = cloud_vector_manager.index_file(file_path, user['id'], project_id, project_root)
             return jsonify({
                 "success": True,
                 "action": "index_file",
                 "file_path": file_path,
                 "indexed": indexed
             })
-        
-        elif action == 'update_file':
-            file_path = data.get('file_path')
-            if not file_path:
-                return jsonify({"error": "file_path required for update_file action"}), 400
             
-            updated = em.update_file(file_path)
+        elif action == 'index_files':
+            # Cloud-ready batch file indexing
+            files = data.get('files', [])
+            if not files:
+                return jsonify({"error": "files array required for index_files action"}), 400
+            
+            batch_info = data.get('batch_info', {})
+            stats = cloud_vector_manager.index_files_with_content(files, user['id'], project_id)
+            
             return jsonify({
                 "success": True,
-                "action": "update_file",
-                "file_path": file_path,
-                "updated": updated
-            })
-        
-        elif action == 'remove_file':
-            file_path = data.get('file_path')
-            if not file_path:
-                return jsonify({"error": "file_path required for remove_file action"}), 400
-            
-            removed = em.remove_file(file_path)
-            return jsonify({
-                "success": True,
-                "action": "remove_file",
-                "file_path": file_path,
-                "removed": removed
+                "action": "index_files",
+                "stats": stats,
+                "batch_info": batch_info,
+                "project_id": project_id
             })
         
         elif action == 'search':
@@ -1692,64 +1699,31 @@ def embed_endpoint():
             if not query:
                 return jsonify({"error": "query required for search action"}), 400
             
-            k = data.get('k', 5)
-            modality_filter = data.get('modality_filter')  # Optional: 'text', 'image', 'audio'
-            include_graph = data.get('include_graph', False)  # Include graph relationships
+            max_results = data.get('k', 5)
+            results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
             
-            if include_graph:
-                # Enhanced search with graph context
-                results = em.search_with_graph_context(query, k, include_connected=True)
-                return jsonify({
-                    "success": True,
-                    "action": "search_with_graph",
-                    "query": query,
-                    "results": results
-                })
-            else:
-                # Regular similarity search
-                results = em.search_similar_files(query, k, modality_filter)
-                return jsonify({
-                    "success": True,
-                    "action": "search",
-                    "query": query,
-                    "modality_filter": modality_filter,
-                    "results": [{"file_path": path, "similarity": score, "modality": modality} for path, score, modality in results]
-                })
+            return jsonify({
+                "success": True,
+                "action": "search",
+                "query": query,
+                "results": results
+            })
         
         elif action == 'status':
-            summary = em.get_project_summary()
-            graph_summary = em.get_graph_summary()
+            stats = cloud_vector_manager.get_stats(user['id'], project_id)
             return jsonify({
                 "success": True,
                 "action": "status",
-                "summary": summary,
-                "graph": graph_summary
+                "stats": stats,
+                "project_id": project_id
             })
         
-        elif action == 'graph_connections':
-            file_path = data.get('file_path')
-            if not file_path:
-                return jsonify({"error": "file_path required for graph_connections action"}), 400
-            
-            max_depth = data.get('max_depth', 2)
-            connections = em.get_connected_files(file_path, max_depth)
-            
+        elif action == 'clear':
+            cloud_vector_manager.clear_project(user['id'], project_id)
             return jsonify({
                 "success": True,
-                "action": "graph_connections",
-                "file_path": file_path,
-                "max_depth": max_depth,
-                "connections": connections
-            })
-        
-        elif action == 'central_files':
-            top_k = data.get('top_k', 10)
-            central_files = em.get_central_files(top_k)
-            
-            return jsonify({
-                "success": True,
-                "action": "central_files",
-                "central_files": [{"file_path": path, "centrality": score} for path, score in central_files]
+                "action": "clear",
+                "message": "Project index cleared successfully"
             })
         
         else:
@@ -1757,6 +1731,8 @@ def embed_endpoint():
     
     except Exception as e:
         print(f"EMBED_ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "error": str(e),
             "success": False
@@ -1765,11 +1741,11 @@ def embed_endpoint():
 @app.route('/search_project', methods=['POST'])
 def search_project():
     """
-    Search across project files using semantic similarity and graph context
+    Search across project files using semantic similarity
     Used by the search_across_project tool
     """
     try:
-        # Verify authentication (with dev mode bypass)
+        # Verify authentication
         user, error_response, status_code = verify_authentication()
         if error_response:
             return jsonify(error_response), status_code
@@ -1777,67 +1753,55 @@ def search_project():
         data = request.json
         query = data.get('query')
         project_root = data.get('project_root')
+        project_id = data.get('project_id')
         
+        # Fallback to header if not provided in body
+        if not project_root:
+            try:
+                project_root = request.headers.get('X-Project-Root') or project_root
+                print(f"SEARCH_PROJECT_HEADERS: X-Project-Root={request.headers.get('X-Project-Root')}")
+            except Exception:
+                pass
+
         if not query:
             return jsonify({"error": "Query required"}), 400
         if not project_root:
-            return jsonify({"error": "project_root required"}), 400
-        
+            return jsonify({"error": "project_root required (pass in body or X-Project-Root header)"}), 400
+
+        # Generate project ID if not provided
+        if not project_id:
+            project_id = hashlib.md5(project_root.encode()).hexdigest()
+
         # Get search parameters
-        include_graph = data.get('include_graph', True)
         max_results = data.get('max_results', 5)
-        modality_filter = data.get('modality_filter')
-        
-        # Get user-specific embedding manager
-        em = get_embedding_manager(user['id'], project_root)
-        
-        if include_graph:
-            # Enhanced search with graph context
-            results = em.search_with_graph_context(query, max_results, include_connected=True)
-            
-            # Format for tool response
-            formatted_results = {
-                "similar_files": [
-                    {
-                        "file_path": path,
-                        "similarity": float(score),
-                        "modality": modality,
-                        "connections": results['connected_files'].get(path, {})
-                    }
-                    for path, score, modality in results['similarity_results']
-                ],
-                "central_files": [
-                    {
-                        "file_path": path,
-                        "centrality": float(score)
-                    }
-                    for path, score in results['central_files']
-                ],
-                "graph_summary": results['graph_summary']
-            }
-        else:
-            # Regular similarity search
-            similarity_results = em.search_similar_files(query, max_results, modality_filter)
-            formatted_results = {
-                "similar_files": [
-                    {
-                        "file_path": path,
-                        "similarity": float(score),
-                        "modality": modality
-                    }
-                    for path, score, modality in similarity_results
-                ],
-                "central_files": [],
-                "graph_summary": {}
-            }
-        
+
+        # Search using cloud vector manager
+        results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
+
+        # Format results
+        formatted_results = {
+            "similar_files": [
+                {
+                    "file_path": r['file_path'],
+                    "similarity": r['similarity'],
+                    "modality": "text",
+                    "chunk_index": r['chunk']['chunk_index'] if r.get('chunk') else 0,
+                    "chunk_start": r['chunk']['start_line'] if r.get('chunk') else None,
+                    "chunk_end": r['chunk']['end_line'] if r.get('chunk') else None,
+                }
+                for r in results
+            ],
+            "central_files": [],
+            "graph_summary": {}
+        }
+
         return jsonify({
             "success": True,
             "query": query,
             "results": formatted_results,
-            "include_graph": include_graph
+            "include_graph": False
         })
-        
+
     except Exception as e:
         print(f"SEARCH_PROJECT_ERROR: {e}")
         return jsonify({
@@ -1850,7 +1814,10 @@ def health_check():
     """Health check endpoint for testing"""
     return jsonify({"status": "healthy", "service": "godot-ai-embedding-service"})
 
+
+
 if __name__ == '__main__':
     # Use PORT environment variable for Cloud Run, fallback to 8000 for local dev
     port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port, debug=False)
     app.run(host='0.0.0.0', port=port, debug=False)

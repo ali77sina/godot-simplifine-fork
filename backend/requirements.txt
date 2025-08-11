@@ -1,18 +1,22 @@
 # Python dependencies for the Godot AI Backend server
 
+# Core dependencies
 flask
 python-dotenv
 openai>=1.50.0  # Required for responses API and image generation
 requests  # For HTTP requests
-google-cloud-storage  # For GCP Cloud Storage
-google-cloud-aiplatform
-vertexai  # For GCP multimodal embeddings
-networkx  # For graph structure analysis
+
+# Authentication (keeping for existing OAuth features)
 google-auth  # For OAuth authentication
 google-auth-oauthlib  # For OAuth flow
 google-auth-httplib2  # For OAuth http requests
-pillow  # For image processing
-numpy  # For embedding operations
-faiss-cpu  # For fast similarity search
-flask-session  # For session management
 authlib  # For OAuth handling 
+
+# Image processing (for image generation features)
+pillow  # For image processing
+
+# Embeddings and search
+numpy  # For embedding operations
+
+# Google Cloud dependencies for vector search
+google-cloud-bigquery  # For BigQuery vector storage

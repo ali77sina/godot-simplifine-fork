@@ -29,6 +29,8 @@ echo "🔧 Enabling required APIs..."
 gcloud services enable cloudbuild.googleapis.com
 gcloud services enable run.googleapis.com
 gcloud services enable containerregistry.googleapis.com
+gcloud services enable bigquery.googleapis.com
+# gcloud services enable aiplatform.googleapis.com  # Not needed for OpenAI embeddings
 
 # Build and push the container image
 echo "🏗️  Building container image..."
@@ -50,6 +52,19 @@ if [ -f ".env" ]; then
     gcloud projects add-iam-policy-binding ${PROJECT_ID} \
         --member="serviceAccount:${COMPUTE_SA}" \
         --role="roles/secretmanager.secretAccessor"
+
+    echo "🔧 Granting BigQuery access to Cloud Run service account..."
+    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+        --member="serviceAccount:${COMPUTE_SA}" \
+        --role="roles/bigquery.user"
+    gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+        --member="serviceAccount:${COMPUTE_SA}" \
+        --role="roles/bigquery.dataEditor"
+    
+    # echo "🔧 Granting Vertex AI access to Cloud Run service account..."
+    # gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+    #     --member="serviceAccount:${COMPUTE_SA}" \
+    #     --role="roles/aiplatform.user"
     
     # Add production OAuth redirect URI
     echo "🔗 Setting production OAuth redirect URI..."

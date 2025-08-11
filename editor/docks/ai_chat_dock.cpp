@@ -49,6 +49,7 @@
 #include "editor/settings/editor_settings.h"
 #include "editor/script/script_editor_plugin.h"
 #include "editor/script/script_text_editor.h"
+#include "modules/gdscript/gdscript.h"
 #include "editor/gui/editor_file_dialog.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
@@ -98,6 +99,7 @@ void AIChatDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_on_at_mention_item_selected"), &AIChatDock::_on_at_mention_item_selected);
 	ClassDB::bind_method(D_METHOD("_on_input_field_gui_input"), &AIChatDock::_on_input_field_gui_input);
 	ClassDB::bind_method(D_METHOD("_on_model_selected"), &AIChatDock::_on_model_selected);
+	ClassDB::bind_method(D_METHOD("_on_index_button_pressed"), &AIChatDock::_on_index_button_pressed);
 	ClassDB::bind_method(D_METHOD("_on_tool_output_toggled"), &AIChatDock::_on_tool_output_toggled);
 	ClassDB::bind_method(D_METHOD("_on_tool_file_link_pressed", "path"), &AIChatDock::_on_tool_file_link_pressed);
 
@@ -124,6 +126,14 @@ void AIChatDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_finalize_conversations_save"), &AIChatDock::_finalize_conversations_save);
 	ClassDB::bind_method(D_METHOD("_execute_delayed_save"), &AIChatDock::_execute_delayed_save);
 	ClassDB::bind_method(D_METHOD("_display_generated_image_deferred", "base64_data", "id"), &AIChatDock::_display_generated_image_deferred);
+	
+	// Embedding system methods
+	ClassDB::bind_method(D_METHOD("_initialize_embedding_system"), &AIChatDock::_initialize_embedding_system);
+	ClassDB::bind_method(D_METHOD("_perform_initial_indexing"), &AIChatDock::_perform_initial_indexing);
+	ClassDB::bind_method(D_METHOD("_scan_and_index_project_files"), &AIChatDock::_scan_and_index_project_files);
+	ClassDB::bind_method(D_METHOD("_send_file_batch"), &AIChatDock::_send_file_batch);
+	ClassDB::bind_method(D_METHOD("_on_embedding_request_completed"), &AIChatDock::_on_embedding_request_completed);
+	ClassDB::bind_method(D_METHOD("_on_embedding_status_tick"), &AIChatDock::_on_embedding_status_tick);
 }
 
 void AIChatDock::_notification(int p_notification) {
@@ -151,21 +161,36 @@ void AIChatDock::_notification(int p_notification) {
 			new_conversation_button->connect("pressed", callable_mp(this, &AIChatDock::_on_new_conversation_pressed));
 			history_container->add_child(new_conversation_button);
 
-			// Model selection row
-			HBoxContainer *top_container = memnew(HBoxContainer);
+            // Model selection row
+            HBoxContainer *top_container = memnew(HBoxContainer);
 			add_child(top_container);
 
 			Label *model_label = memnew(Label);
 			model_label->set_text("Model:");
 			top_container->add_child(model_label);
 
-			model_dropdown = memnew(OptionButton);
+            model_dropdown = memnew(OptionButton);
+			model_dropdown->add_item("gpt-5");
 			model_dropdown->add_item("gpt-4o");
 			model_dropdown->add_item("gpt-4-turbo");
 			model_dropdown->add_item("gpt-3.5-turbo");
 			model_dropdown->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 			model_dropdown->connect("item_selected", callable_mp(this, &AIChatDock::_on_model_selected));
 			top_container->add_child(model_dropdown);
+
+            // Index button
+            index_button = memnew(Button);
+            index_button->set_text("Index");
+            index_button->set_tooltip_text("Index current project for multimodal search");
+            index_button->add_theme_icon_override("icon", get_theme_icon(SNAME("ReloadSmall"), SNAME("EditorIcons")));
+            index_button->connect("pressed", callable_mp(this, &AIChatDock::_on_index_button_pressed));
+            top_container->add_child(index_button);
+
+            // Embedding status label
+            embedding_status_label = memnew(Label);
+            embedding_status_label->set_text("");
+            embedding_status_label->set_modulate(Color(0.8, 0.8, 0.8));
+            top_container->add_child(embedding_status_label);
 			
 			// Setup authentication UI
 			_setup_authentication_ui();
@@ -606,7 +631,7 @@ void AIChatDock::_send_stop_request() {
 	json.instantiate();
 	String request_body = json->stringify(request_data);
 	
-	PackedStringArray headers;
+    PackedStringArray headers;
 	headers.push_back("Content-Type: application/json");
 	
 	// Extract stop endpoint from main API endpoint
@@ -1093,6 +1118,11 @@ void AIChatDock::_stop_login_polling() {
 		login_poll_timer->stop();
 		print_line("AI Chat: ✅ Stopped login polling");
 	}
+}
+
+void AIChatDock::_on_index_button_pressed() {
+    print_line("AI Chat: ▶️ Index button pressed");
+    _ensure_project_indexing();
 }
 
 void AIChatDock::_ensure_project_indexing() {
@@ -1765,11 +1795,21 @@ void AIChatDock::_on_files_selected(const Vector<String> &p_files) {
 				// Process image asynchronously to prevent UI blocking
 				call_deferred("_process_image_attachment_async", file_path, attached_file.name, attached_file.mime_type);
 			} else {
-				// Read text file content
-				Error err;
-				String content = FileAccess::get_file_as_string(file_path, &err);
-				if (err == OK) {
-					attached_file.content = content;
+				// Read text file content with safety limits to avoid blowing context
+				Error err = OK;
+				Ref<FileAccess> f = FileAccess::open(file_path, FileAccess::READ, &err);
+				if (err == OK && f.is_valid()) {
+					int64_t to_read = MIN(f->get_length(), (int64_t)MAX_TEXT_ATTACHMENT_PREVIEW_BYTES);
+					PackedByteArray bytes;
+					bytes.resize(to_read);
+					int64_t read = f->get_buffer(bytes.ptrw(), to_read);
+					f->close();
+					String content = String::utf8((const char *)bytes.ptr(), (int)read);
+					attached_file.content = _truncate_text_for_context(content);
+					bool truncated = f->get_length() > to_read || content.length() > attached_file.content.length();
+					if (truncated) {
+						attached_file.content += "\n\n…\n[Truncated preview of large file. Only first " + String::num_int64(attached_file.content.length()) + " chars shown.]";
+					}
 					current_attached_files.push_back(attached_file);
 				} else {
 					print_line("AI Chat: Failed to read file: " + file_path);
@@ -2046,11 +2086,21 @@ void AIChatDock::_attach_external_files(const Vector<String> &p_files) {
 					print_line("AI Chat: Failed to process external image: " + file_path);
 				}
 			} else {
-				// Read text file content
-				Error err;
-				String content = FileAccess::get_file_as_string(file_path, &err);
-				if (err == OK) {
-					attached_file.content = content;
+				// Read text file content with safety limits to avoid blowing context
+				Error err = OK;
+				Ref<FileAccess> f = FileAccess::open(file_path, FileAccess::READ, &err);
+				if (err == OK && f.is_valid()) {
+					int64_t to_read = MIN(f->get_length(), (int64_t)MAX_TEXT_ATTACHMENT_PREVIEW_BYTES);
+					PackedByteArray bytes;
+					bytes.resize(to_read);
+					int64_t read = f->get_buffer(bytes.ptrw(), to_read);
+					f->close();
+					String content = String::utf8((const char *)bytes.ptr(), (int)read);
+					attached_file.content = _truncate_text_for_context(content);
+					bool truncated = f->get_length() > to_read || content.length() > attached_file.content.length();
+					if (truncated) {
+						attached_file.content += "\n\n…\n[Truncated preview of large file. Only first " + String::num_int64(attached_file.content.length()) + " chars shown.]";
+					}
 					current_attached_files.push_back(attached_file);
 				} else {
 					print_line("AI Chat: Failed to read external file: " + file_path + " (Error: " + String::num_int64(err) + ")");
@@ -2639,31 +2689,52 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 			result = EditorTools::inspect_animation_state(args);
 		} else if (function_name == "get_layers_and_zindex") {
 			result = EditorTools::get_layers_and_zindex(args);
-		} else if (function_name == "create_script_file") {
-			// create_script_file method no longer exists, use apply_edit instead
-			result["success"] = false;
-			result["message"] = "create_script_file is no longer available, use apply_edit instead";
+        } else if (function_name == "create_script_file") {
+            // Map deprecated create_script_file to apply_edit for forward compatibility
+            // Expect args: { path, description, script_type?, node_type? }
+            String target_path = String(args.get("path", ""));
+            String description = String(args.get("description", ""));
+            String script_type = String(args.get("script_type", ""));
+            String node_type = String(args.get("node_type", ""));
+
+            Dictionary apply_args;
+            apply_args["path"] = target_path;
+            // Craft a prompt for file creation when using apply_edit
+            String composed_prompt;
+            composed_prompt += "Create or overwrite this file with a valid Godot 4.x script.\n";
+            if (!script_type.is_empty()) composed_prompt += "Script type: " + script_type + "\n";
+            if (!node_type.is_empty()) composed_prompt += "Node type: " + node_type + "\n";
+            if (!description.is_empty()) composed_prompt += "Requirements: " + description + "\n";
+            composed_prompt += "Return only the complete file content.";
+            apply_args["prompt"] = composed_prompt;
+
+            result = EditorTools::apply_edit(apply_args);
 		} else if (function_name == "delete_file_safe") {
 			// delete_file_safe method no longer exists
 			result["success"] = false;
 			result["message"] = "delete_file_safe is no longer available";
-		} else if (function_name == "edit_file_with_diff") {
-			// edit_file_with_diff method no longer exists, use apply_edit instead
-			result["success"] = false;
-			result["message"] = "edit_file_with_diff is no longer available, use apply_edit instead";
+        } else if (function_name == "edit_file_with_diff") {
+            // Deprecated tool removed from backend; return a hard error instructing the model to switch.
+            result["success"] = false;
+            result["message"] = "Tool 'edit_file_with_diff' has been removed. Use 'apply_edit' instead.";
 		} else if (function_name == "image_operation") {
 			// This tool should be handled by the backend, not the frontend
 			// If we receive it here, it means something went wrong in the backend filtering
 			result["success"] = false;
 			result["message"] = "Image generation should be handled by backend, not frontend";
 			print_line("AI Chat: Received image_operation tool in frontend - this should be handled by backend");
+        } else if (function_name == "editor_introspect") {
+            // Execute multiplexed introspection/debug tool
+            result = EditorTools::editor_introspect(args);
 		} else {
 			result["success"] = false;
 			result["message"] = "Unknown tool: " + function_name;
 		}
 
-		// Add a proper, separate tool bubble for the output.
-		_add_tool_response_to_chat(tool_call_id, function_name, args, result);
+        // Add a proper, separate tool bubble for the output.
+        _add_tool_response_to_chat(tool_call_id, function_name, args, result);
+
+        // Note: Do not inject unsolicited tool results here. The model must request tools.
 		
 		// Don't add system messages - they break OpenAI format!
 		// bool success = result.get("success", false);
@@ -2846,8 +2917,53 @@ void AIChatDock::_scroll_to_bottom() {
 	}
 }
 
+String AIChatDock::_truncate_text_for_context(const String &p_text, int p_max_chars) {
+    if (p_text.length() <= p_max_chars) {
+        return p_text;
+    }
+    // Keep head and tail to preserve useful context
+    int head = p_max_chars * 3 / 4;
+    int tail = p_max_chars - head;
+    String head_str = p_text.substr(0, head);
+    String tail_str = p_text.substr(p_text.length() - tail, tail);
+    return head_str + "\n\n…\n[Middle omitted; content truncated to fit context]\n\n" + tail_str;
+}
+
 void AIChatDock::_on_tool_file_link_pressed(const String &p_path) {
-	EditorNode::get_singleton()->load_scene(p_path);
+    String path = p_path;
+    if (path.ends_with(".uid")) {
+        path = path.trim_suffix(".uid");
+    }
+    // If path is absolute, try to convert to res:// when possible
+    if (path.begins_with("/")) {
+        String project_root = ProjectSettings::get_singleton()->globalize_path("res://");
+        if (path.begins_with(project_root)) {
+            String rel = path.substr(project_root.length());
+            if (rel.begins_with("/")) rel = rel.substr(1);
+            path = String("res://") + rel;
+        }
+    }
+    print_line("AI Chat: Opening file from search: " + path);
+    String ext = path.get_extension().to_lower();
+    if (ext == "tscn" || ext == "scn") {
+        // Open scene in editor
+        EditorInterface::get_singleton()->open_scene_from_path(path);
+        return;
+    }
+    if (ext == "gd" || ext == "cs") {
+        // Open script in script editor
+        Ref<Resource> res = ResourceLoader::load(path);
+        Ref<Script> script = res;
+        if (script.is_valid()) {
+            ScriptEditor *se = ScriptEditor::get_singleton();
+            if (se) {
+                se->edit(script);
+                return;
+            }
+        }
+    }
+    // Fallback: try generic load
+    EditorNode::get_singleton()->load_scene(path);
 }
 
 void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message, int p_message_index) {
@@ -3571,26 +3687,56 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 			search_files_vbox->add_child(files_tree);
 		}
 
-	} else if (p_tool_name == "apply_edit" && p_success) {
-		VBoxContainer *edit_vbox = memnew(VBoxContainer);
-		p_content_vbox->add_child(edit_vbox);
+    } else if (p_tool_name == "apply_edit" && p_success) {
+        // Inline Accept/Reject diff preview in the Script Editor
+        String file_path = p_args.has("path") ? p_args.get("path", "Unknown") : p_args.get("file_path", "Unknown");
+        String original_content = p_result.get("original_content", "");
+        String edited_content = p_result.get("edited_content", "");
 
-		String file_path = p_args.get("file_path", "Unknown");
-		Dictionary diff = p_result.get("diff", Dictionary());
-		
-		Label *file_label = memnew(Label);
-		file_label->set_text("Applied edit to: " + file_path);
-		file_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
-		edit_vbox->add_child(file_label);
-		
-		if (!diff.is_empty()) {
-			Label *changes_label = memnew(Label);
-			int added = diff.get("lines_added", 0);
-			int removed = diff.get("lines_removed", 0);
-			changes_label->set_text("Changes: +" + String::num_int64(added) + " -" + String::num_int64(removed));
-			changes_label->add_theme_color_override("font_color", get_theme_color(SNAME("success_color"), SNAME("Editor")));
-			edit_vbox->add_child(changes_label);
-		}
+        ScriptEditor *script_editor = ScriptEditor::get_singleton();
+        if (script_editor) {
+            // Ensure file exists on disk so saving (Cmd+S) works
+            if (!file_path.is_empty() && !FileAccess::exists(file_path)) {
+                String base_dir = file_path.get_base_dir();
+                String abs_dir = ProjectSettings::get_singleton()->globalize_path(base_dir);
+                DirAccess::make_dir_recursive_absolute(abs_dir);
+                Ref<FileAccess> f = FileAccess::open(file_path, FileAccess::WRITE);
+                if (f.is_valid()) {
+                    f->store_string(original_content);
+                    f->close();
+                }
+            }
+
+            // Open the script if it exists
+            Ref<Resource> resource = ResourceLoader::load(file_path);
+            Ref<Script> script = resource;
+            if (script.is_valid()) {
+                script_editor->edit(script);
+            } else {
+                // Create an in-memory GDScript tab so we can display inline diff
+                Ref<GDScript> tmp_script;
+                tmp_script.instantiate();
+                // Pretend this resource lives at the requested path so the editor treats it as that file
+                if (!file_path.is_empty()) {
+                    tmp_script->set_path_cache(file_path);
+                }
+                tmp_script->set_source_code(original_content);
+                script = tmp_script;
+                script_editor->edit(script);
+            }
+            ScriptTextEditor *ste = Object::cast_to<ScriptTextEditor>(script_editor->get_current_editor());
+            if (ste) {
+                ste->set_diff(original_content, edited_content);
+            }
+        }
+
+        // Also render a compact status in the chat bubble
+        VBoxContainer *edit_vbox = memnew(VBoxContainer);
+        p_content_vbox->add_child(edit_vbox);
+        Label *status = memnew(Label);
+        status->set_text("Inline preview ready in Script Editor (Accept/Reject). File: " + file_path);
+        status->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1,1,1,0.8));
+        edit_vbox->add_child(status);
 
 	} else if (p_tool_name == "get_scene_tree_hierarchy" && p_success) {
 		VBoxContainer *hierarchy_vbox = memnew(VBoxContainer);
@@ -3757,7 +3903,7 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 		
 		search_vbox->add_child(memnew(HSeparator));
 		
-		// Similar files section
+        // Similar files section
 		if (similar_files.size() > 0) {
 			Label *similar_header = memnew(Label);
 			similar_header->set_text("📁 Similar Files (" + String::num_int64(similar_files.size()) + ")");
@@ -3769,6 +3915,9 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 				String file_path = file_result.get("file_path", "");
 				float similarity = file_result.get("similarity", 0.0);
 				String modality = file_result.get("modality", "text");
+                int64_t chunk_index = (int64_t)file_result.get("chunk_index", -1);
+                int64_t chunk_start = (int64_t)file_result.get("chunk_start", -1);
+                int64_t chunk_end = (int64_t)file_result.get("chunk_end", -1);
 				
 				HBoxContainer *file_hbox = memnew(HBoxContainer);
 				search_vbox->add_child(file_hbox);
@@ -3789,6 +3938,14 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 				score_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
 				score_label->set_custom_minimum_size(Size2(120, 0));
 				file_hbox->add_child(score_label);
+
+                // Chunk range (if present)
+                if (chunk_start >= 0 && chunk_end > chunk_start) {
+                    Label *range_label = memnew(Label);
+                    range_label->set_text(vformat("[chunk %d: %d-%d]", (int)chunk_index, (int)chunk_start, (int)chunk_end));
+                    range_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
+                    file_hbox->add_child(range_label);
+                }
 			}
 		}
 		
@@ -4376,6 +4533,7 @@ void AIChatDock::_finalize_chat_request() {
 	// Build final request data
 	Dictionary request_data;
 	request_data["messages"] = _chunked_messages;
+	request_data["model"] = model;
 
 	// Debug logs for OpenAI messages have been quieted to reduce console noise.
 
@@ -4390,8 +4548,10 @@ void AIChatDock::_finalize_chat_request() {
 	if (!auth_token.is_empty()) {
 		headers.push_back("Authorization: Bearer " + auth_token);
 	}
-	headers.push_back("X-User-ID: " + current_user_id);
+    headers.push_back("X-User-ID: " + current_user_id);
 	headers.push_back("X-Machine-ID: " + get_machine_id());
+    // Always pass current project root to ensure backend targets the right project
+    headers.push_back("X-Project-Root: " + ProjectSettings::get_singleton()->globalize_path("res://"));
 
 	// Setup HTTPClient for streaming
 	http_client->set_read_chunk_size(4096); // 4kb chunk size
@@ -4695,35 +4855,43 @@ void AIChatDock::set_model(const String &p_model) {
 }
 
 void AIChatDock::_save_layout_to_config(Ref<ConfigFile> p_layout, const String &p_section) const {
-	p_layout->set_value(p_section, "api_endpoint", api_endpoint);
-	p_layout->set_value(p_section, "model", model);
+    // Force saving local endpoint during development
+    p_layout->set_value(p_section, "api_endpoint", String("http://127.0.0.1:8000/chat"));
+    p_layout->set_value(p_section, "model", model);
 }
 
 void AIChatDock::_load_layout_from_config(Ref<ConfigFile> p_layout, const String &p_section) {
-	if (p_layout->has_section_key(p_section, "api_endpoint")) {
-		api_endpoint = p_layout->get_value(p_section, "api_endpoint");
-		// Normalize and migrate endpoint to cloud if it was pointing to localhost.
-		String endpoint = api_endpoint.strip_edges();
-		if (endpoint.is_empty()) {
-			api_endpoint = "https://gamechat.simplifine.com/chat";
-		} else {
-			String lower = endpoint.to_lower();
-			bool was_local = lower.find("localhost") != -1 || lower.find("127.0.0.1") != -1;
-			if (was_local) {
-				api_endpoint = "https://gamechat.simplifine.com/chat";
-			} else {
-				// Ensure scheme.
-				if (!endpoint.begins_with("http://") && !endpoint.begins_with("https://")) {
-					endpoint = "https://" + endpoint;
-				}
-				// Ensure it contains /chat so other routes (auth/embed/stop) can be derived via replace.
-				if (endpoint.find("/chat") == -1) {
-					endpoint = endpoint.ends_with("/") ? endpoint + "chat" : endpoint + "/chat";
-				}
-				api_endpoint = endpoint;
-			}
-		}
-	}
+
+
+	// if (p_layout->has_section_key(p_section, "api_endpoint")) {
+    //     api_endpoint = p_layout->get_value(p_section, "api_endpoint");
+    //     // Normalize and migrate endpoint to cloud if it was pointing to localhost.
+    //     String endpoint = api_endpoint.strip_edges();
+    //     if (endpoint.is_empty()) {
+    //         api_endpoint = "https://gamechat.simplifine.com/chat";
+    //     } else {
+    //         String lower = endpoint.to_lower();
+    //         bool was_local = lower.find("localhost") != -1 || lower.find("127.0.0.1") != -1;
+    //         if (was_local) {
+    //             api_endpoint = "https://gamechat.simplifine.com/chat";
+    //         } else {
+    //             // Ensure scheme.
+    //             if (!endpoint.begins_with("http://") && !endpoint.begins_with("https://")) {
+    //                 endpoint = "https://" + endpoint;
+    //             }
+    //             // Ensure it contains /chat so other routes (auth/embed/stop) can be derived via replace.
+    //             if (endpoint.find("/chat") == -1) {
+    //                 endpoint = endpoint.ends_with("/") ? endpoint + "chat" : endpoint + "/chat";
+    //             }
+    //             api_endpoint = endpoint;
+    //         }
+    //     }
+    // }
+
+
+
+    // Force local endpoint unconditionally during development
+    api_endpoint = "http://127.0.0.1:8000/chat";
 	if (p_layout->has_section_key(p_section, "model")) {
 		model = p_layout->get_value(p_section, "model");
 	}
@@ -6035,7 +6203,7 @@ void AIChatDock::_attach_scene_node(Node *p_node) {
 	AIChatDock::AttachedFile attached_file;
 	attached_file.path = node_path_str;
 	attached_file.name = String(p_node->get_name()) + " (" + String(p_node->get_class()) + ")";
-	attached_file.content = _get_node_info_string(p_node);
+    attached_file.content = _truncate_text_for_context(_get_node_info_string(p_node));
 	attached_file.is_node = true;
 	attached_file.node_path = p_node->get_path();
 	attached_file.node_type = p_node->get_class();
@@ -6076,7 +6244,7 @@ void AIChatDock::_attach_current_script() {
 	AIChatDock::AttachedFile attached_file;
 	attached_file.path = script_path;
 	attached_file.name = script_path.get_file();
-	attached_file.content = text_editor->get_code_editor()->get_text_editor()->get_text();
+    attached_file.content = _truncate_text_for_context(text_editor->get_code_editor()->get_text_editor()->get_text());
 	attached_file.is_image = false;
 	attached_file.mime_type = _get_mime_type_from_extension(script_path);
 	
@@ -6174,6 +6342,488 @@ String AIChatDock::get_machine_id() const {
 		machine_id = machine_id.replace(" ", "_").replace("(", "").replace(")", "");
 	}
 	return machine_id;
+}
+
+// ========== EMBEDDING SYSTEM IMPLEMENTATION ==========
+
+void AIChatDock::_initialize_embedding_system() {
+	print_line("AI Chat: 🔧 Initializing cloud-based embedding system");
+	
+	if (!_is_user_authenticated()) {
+		print_line("AI Chat: ❌ Cannot initialize embedding system - user not authenticated");
+		_set_embedding_status("Login required", false);
+		return;
+	}
+	
+	// Create HTTPRequest for embedding API calls
+	if (!embedding_request) {
+		embedding_request = memnew(HTTPRequest);
+		add_child(embedding_request);
+		embedding_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_embedding_request_completed));
+	}
+	
+	// Setup status timer for animated dots
+	if (!embedding_status_timer) {
+		embedding_status_timer = memnew(Timer);
+		embedding_status_timer->set_wait_time(0.5);
+		embedding_status_timer->set_one_shot(false);
+		embedding_status_timer->connect("timeout", callable_mp(this, &AIChatDock::_on_embedding_status_tick));
+		add_child(embedding_status_timer);
+	}
+	
+	embedding_system_initialized = true;
+	_set_embedding_status("Ready to index", false);
+	
+	// Check current index status
+	_send_embedding_request("status");
+	
+	print_line("AI Chat: ✅ Embedding system initialized successfully");
+}
+
+void AIChatDock::_perform_initial_indexing() {
+	print_line("AI Chat: 📚 Starting project indexing...");
+	
+	if (!embedding_system_initialized || !_is_user_authenticated()) {
+		print_line("AI Chat: ❌ Cannot start indexing - system not ready");
+		return;
+	}
+	
+	if (embedding_in_progress) {
+		print_line("AI Chat: ⏳ Indexing already in progress");
+		return;
+	}
+	
+	_set_embedding_status("Scanning files", true);
+	
+	// Scan project files and read their contents
+	call_deferred("_scan_and_index_project_files");
+}
+
+void AIChatDock::_send_embedding_request(const String &p_action, const Dictionary &p_data) {
+	if (!embedding_request || embedding_request_busy) {
+		print_line("AI Chat: ❌ Cannot send embedding request - busy or not initialized");
+		return;
+	}
+	
+	String embed_url = _get_embed_base_url() + "/embed";
+	
+	Dictionary request_data;
+	request_data["action"] = p_action;
+	
+	// Always include project_root for all embedding requests
+	request_data["project_root"] = _get_project_root_path();
+	
+	if (!p_data.is_empty()) {
+		for (const Variant *key = p_data.next(); key; key = p_data.next(key)) {
+			request_data[*key] = p_data[*key];
+		}
+	}
+	
+	Ref<JSON> json;
+	json.instantiate();
+	String request_body = json->stringify(request_data);
+	
+	PackedStringArray headers;
+	headers.push_back("Content-Type: application/json");
+	
+	// Add authentication headers
+	if (!auth_token.is_empty()) {
+		headers.push_back("Authorization: Bearer " + auth_token);
+	}
+	headers.push_back("X-User-ID: " + current_user_id);
+	headers.push_back("X-Machine-ID: " + get_machine_id());
+	
+	print_line("AI Chat: 📡 Sending embedding request: " + p_action + " to " + embed_url);
+	
+	embedding_request_busy = true;
+	Error err = embedding_request->request(embed_url, headers, HTTPClient::METHOD_POST, request_body);
+	
+	if (err != OK) {
+		print_line("AI Chat: ❌ Failed to send embedding request: " + String::num_int64(err));
+		embedding_request_busy = false;
+		_set_embedding_status("Request failed", false);
+	}
+}
+
+void AIChatDock::_on_embedding_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
+	embedding_request_busy = false;
+	
+	print_line("AI Chat: 📨 Embedding request completed - Result: " + String::num_int64(p_result) + ", Code: " + String::num_int64(p_code));
+	
+	if (p_result != HTTPRequest::RESULT_SUCCESS || p_code != 200) {
+		String error_msg = "Request failed (" + String::num_int64(p_code) + ")";
+		print_line("AI Chat: ❌ " + error_msg);
+		_set_embedding_status(error_msg, false);
+		return;
+	}
+	
+	String response_text = String::utf8((const char *)p_body.ptr(), p_body.size());
+	
+	Ref<JSON> json;
+	json.instantiate();
+	Error parse_err = json->parse(response_text);
+	
+	if (parse_err != OK) {
+		print_line("AI Chat: ❌ Failed to parse embedding response");
+		_set_embedding_status("Parse error", false);
+		return;
+	}
+	
+	Dictionary response = json->get_data();
+	bool success = response.get("success", false);
+	String action = response.get("action", "");
+	
+	if (!success) {
+		String error = response.get("error", "Unknown error");
+		print_line("AI Chat: ❌ Embedding request failed: " + error);
+		_set_embedding_status("Error: " + error, false);
+		return;
+	}
+	
+	print_line("AI Chat: ✅ Embedding action '" + action + "' completed successfully");
+	
+	if (action == "index_project") {
+		Dictionary stats = response.get("stats", Dictionary());
+		int total = stats.get("total", 0);
+		int indexed = stats.get("indexed", 0);
+		int skipped = stats.get("skipped", 0);
+		
+		String status_text = "Indexed " + String::num_int64(indexed) + "/" + String::num_int64(total) + " files";
+		if (skipped > 0) {
+			status_text += " (" + String::num_int64(skipped) + " skipped)";
+		}
+		
+		_set_embedding_status(status_text, false);
+		initial_indexing_done = true;
+		
+		print_line("AI Chat: 🎉 Project indexing completed - " + status_text);
+		
+	} else if (action == "index_files") {
+		// Handle batch processing response
+		Dictionary stats = response.get("stats", Dictionary());
+		int batch_indexed = stats.get("indexed", 0);
+		int batch_skipped = stats.get("skipped", 0);
+		int batch_failed = stats.get("failed", 0);
+		
+		print_line("AI Chat: ✅ Batch completed - indexed: " + String::num_int64(batch_indexed) + ", skipped: " + String::num_int64(batch_skipped) + ", failed: " + String::num_int64(batch_failed));
+		
+		// Check if we need to send more batches
+		if (current_batch_info.has("current_batch") && current_batch_info.has("total_batches")) {
+			int current_batch = current_batch_info["current_batch"];
+			int total_batches = current_batch_info["total_batches"];
+			
+			if (current_batch < total_batches) {
+				// Send next batch
+				int next_batch = current_batch + 1;
+				int start_index = current_batch_info["start_index"];
+				int batch_size = current_batch_info["batch_size"];
+				Array all_files = current_batch_info["all_files"];
+				
+				int next_start_index = start_index + batch_size;
+				
+				_set_embedding_status("Indexing files (batch " + String::num_int64(next_batch) + "/" + String::num_int64(total_batches) + ")", true);
+				call_deferred("_send_file_batch", all_files, next_start_index, batch_size, next_batch, total_batches);
+			} else {
+				// All batches completed
+				_set_embedding_status("All files indexed successfully", false);
+				initial_indexing_done = true;
+				print_line("AI Chat: 🎉 All file batches completed successfully");
+			}
+		}
+		
+	} else if (action == "status") {
+		Dictionary stats = response.get("stats", Dictionary());
+		int files_indexed = stats.get("files_indexed", 0);
+		
+		if (files_indexed > 0) {
+			String status_text = String::num_int64(files_indexed) + " files indexed";
+			_set_embedding_status(status_text, false);
+			initial_indexing_done = true;
+		} else {
+			_set_embedding_status("No files indexed", false);
+			initial_indexing_done = false;
+		}
+		
+	} else if (action == "clear") {
+		_set_embedding_status("Index cleared", false);
+		initial_indexing_done = false;
+	}
+}
+
+String AIChatDock::_get_project_root_path() {
+	return ProjectSettings::get_singleton()->globalize_path("res://");
+}
+
+String AIChatDock::_get_embed_base_url() {
+	// Use same endpoint as chat but for embedding operations
+	String base_url = api_endpoint;
+	
+	// Remove /chat suffix if present and replace with embedding endpoint
+	if (base_url.ends_with("/chat")) {
+		base_url = base_url.substr(0, base_url.length() - 5);
+	}
+	
+	return base_url;
+}
+
+void AIChatDock::_set_embedding_status(const String &p_text, bool p_busy) {
+	if (!embedding_status_label) {
+		return;
+	}
+	
+	embedding_in_progress = p_busy;
+	embedding_status_base = p_text;
+	embedding_status_dots = 0;
+	
+	if (p_busy) {
+		embedding_status_label->set_text(p_text + "...");
+		embedding_status_label->set_modulate(Color(1.0, 0.8, 0.0)); // Yellow for in-progress
+		if (embedding_status_timer) {
+			embedding_status_timer->start();
+		}
+	} else {
+		embedding_status_label->set_text(p_text);
+		embedding_status_label->set_modulate(Color(0.7, 0.7, 0.7)); // Gray for idle
+		if (embedding_status_timer) {
+			embedding_status_timer->stop();
+		}
+	}
+}
+
+void AIChatDock::_on_embedding_status_tick() {
+	if (!embedding_in_progress || !embedding_status_label) {
+		return;
+	}
+	
+	embedding_status_dots = (embedding_status_dots + 1) % 4;
+	String dots = "";
+	for (int i = 0; i < embedding_status_dots; i++) {
+		dots += ".";
+	}
+	
+	embedding_status_label->set_text(embedding_status_base + dots);
+}
+
+bool AIChatDock::_should_index_file(const String &p_file_path) {
+	// Use same logic as the cloud vector manager
+	String ext = p_file_path.get_extension().to_lower();
+	
+	// Skip binary files
+	PackedStringArray binary_exts = PackedStringArray();
+	binary_exts.push_back("png");
+	binary_exts.push_back("jpg");
+	binary_exts.push_back("jpeg");
+	binary_exts.push_back("gif");
+	binary_exts.push_back("bmp");
+	binary_exts.push_back("webp");
+	binary_exts.push_back("mp3");
+	binary_exts.push_back("wav");
+	binary_exts.push_back("ogg");
+	binary_exts.push_back("mp4");
+	binary_exts.push_back("avi");
+	binary_exts.push_back("mov");
+	binary_exts.push_back("exe");
+	binary_exts.push_back("dll");
+	binary_exts.push_back("so");
+	binary_exts.push_back("dylib");
+	
+	if (binary_exts.has(ext)) {
+		return false;
+	}
+	
+	// Skip hidden files and system directories
+	String filename = p_file_path.get_file();
+	if (filename.begins_with(".")) {
+		return false;
+	}
+	
+	return true;
+}
+
+void AIChatDock::_update_file_embedding(const String &p_file_path) {
+	if (!embedding_system_initialized || !_should_index_file(p_file_path)) {
+		return;
+	}
+	
+	Dictionary payload;
+	payload["file_path"] = p_file_path;
+	payload["project_root"] = _get_project_root_path();
+	
+	_send_embedding_request("index_file", payload);
+}
+
+void AIChatDock::_remove_file_embedding(const String &p_file_path) {
+	if (!embedding_system_initialized) {
+		return;
+	}
+	
+	Dictionary payload;
+	payload["file_path"] = p_file_path;
+	payload["project_root"] = _get_project_root_path();
+	
+	_send_embedding_request("remove_file", payload);
+}
+
+void AIChatDock::_on_filesystem_changed() {
+	// Called when filesystem changes - could trigger incremental indexing
+	// For now, just log the event
+	print_line("AI Chat: 📁 Filesystem changed - incremental indexing not implemented yet");
+}
+
+void AIChatDock::_on_sources_changed(bool p_exist) {
+	// Called when source files change
+	print_line("AI Chat: 📝 Sources changed: " + String(p_exist ? "exist" : "removed"));
+}
+
+void AIChatDock::_suggest_relevant_files(const String &p_query) {
+	// TODO: Implement smart file suggestions based on embedding similarity
+	print_line("AI Chat: 🔍 Smart file suggestions not implemented yet for query: " + p_query);
+}
+
+void AIChatDock::_auto_attach_relevant_context() {
+	// TODO: Implement automatic context attachment based on message content
+	print_line("AI Chat: 🤖 Auto context attachment not implemented yet");
+}
+
+void AIChatDock::_scan_and_index_project_files() {
+	print_line("AI Chat: 📁 Scanning project files for indexing...");
+	
+	String project_root = _get_project_root_path();
+	Array file_contents = Array();
+	int files_processed = 0;
+	int files_skipped = 0;
+	
+	// Get all files in project recursively
+	_scan_directory_recursive(project_root, project_root, file_contents, files_processed, files_skipped);
+	
+	print_line("AI Chat: 📊 Scan complete - " + String::num_int64(files_processed) + " files to index, " + String::num_int64(files_skipped) + " skipped");
+	
+	if (file_contents.size() == 0) {
+		_set_embedding_status("No files to index", false);
+		return;
+	}
+	
+	// Send files in batches to avoid huge HTTP requests
+	int batch_size = 20; // Process 20 files at a time
+	int total_batches = (file_contents.size() + batch_size - 1) / batch_size;
+	
+	_set_embedding_status("Indexing files (batch 1/" + String::num_int64(total_batches) + ")", true);
+	_send_file_batch(file_contents, 0, batch_size, 1, total_batches);
+}
+
+void AIChatDock::_scan_directory_recursive(const String &p_dir_path, const String &p_project_root, Array &p_file_contents, int &p_files_processed, int &p_files_skipped) {
+	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
+	if (dir.is_null()) {
+		print_line("AI Chat: ❌ Cannot access directory: " + p_dir_path);
+		return;
+	}
+	
+	dir->list_dir_begin();
+	String file_name = dir->get_next();
+	
+	while (!file_name.is_empty()) {
+		String full_path = p_dir_path.path_join(file_name);
+		
+		if (dir->current_is_dir()) {
+			// Skip hidden directories and common build/cache dirs
+			if (!file_name.begins_with(".") && 
+				file_name != "build" && 
+				file_name != "bin" && 
+				file_name != "obj" && 
+				file_name != "__pycache__") {
+				_scan_directory_recursive(full_path, p_project_root, p_file_contents, p_files_processed, p_files_skipped);
+			} else {
+				p_files_skipped++;
+			}
+		} else {
+			// Check if we should index this file
+			if (_should_index_file(full_path)) {
+				Dictionary file_data = _read_file_for_indexing(full_path, p_project_root);
+				if (!file_data.is_empty()) {
+					p_file_contents.push_back(file_data);
+					p_files_processed++;
+				} else {
+					p_files_skipped++;
+				}
+			} else {
+				p_files_skipped++;
+			}
+		}
+		
+		file_name = dir->get_next();
+	}
+	
+	dir->list_dir_end();
+}
+
+Dictionary AIChatDock::_read_file_for_indexing(const String &p_file_path, const String &p_project_root) {
+	Ref<FileAccess> file = FileAccess::open(p_file_path, FileAccess::READ);
+	if (file.is_null()) {
+		print_line("AI Chat: ❌ Cannot read file: " + p_file_path);
+		return Dictionary();
+	}
+	
+	String content = file->get_as_text(true); // Skip BOM if present
+	file->close();
+	
+	// Skip empty files or files with only whitespace
+	if (content.strip_edges().is_empty()) {
+		return Dictionary();
+	}
+	
+	// Get relative path from project root
+	String relative_path = p_file_path.replace(p_project_root, "");
+	if (relative_path.begins_with("/") || relative_path.begins_with("\\")) {
+		relative_path = relative_path.substr(1);
+	}
+	
+	// Calculate content hash for change detection
+	String content_hash = _calculate_content_hash(content);
+	
+	Dictionary file_data;
+	file_data["path"] = relative_path;
+	file_data["content"] = content;
+	file_data["hash"] = content_hash;
+	file_data["size"] = content.length();
+	
+	return file_data;
+}
+
+String AIChatDock::_calculate_content_hash(const String &p_content) {
+	// Simple hash calculation using Godot's built-in hash function
+	uint32_t hash_value = p_content.hash();
+	return String::num_uint64(hash_value, 16);
+}
+
+void AIChatDock::_send_file_batch(const Array &p_all_files, int p_start_index, int p_batch_size, int p_current_batch, int p_total_batches) {
+	Array batch_files = Array();
+	int end_index = MIN(p_start_index + p_batch_size, p_all_files.size());
+	
+	// Create batch
+	for (int i = p_start_index; i < end_index; i++) {
+		batch_files.push_back(p_all_files[i]);
+	}
+	
+	// Prepare request data
+	Dictionary batch_info_dict;
+	batch_info_dict["current"] = p_current_batch;
+	batch_info_dict["total"] = p_total_batches;
+	batch_info_dict["files_in_batch"] = batch_files.size();
+	
+	Dictionary payload;
+	payload["files"] = batch_files;
+	payload["batch_info"] = batch_info_dict;
+	
+	// Store batch info for handling response
+	current_batch_info["start_index"] = p_start_index;
+	current_batch_info["batch_size"] = p_batch_size;
+	current_batch_info["current_batch"] = p_current_batch;
+	current_batch_info["total_batches"] = p_total_batches;
+	current_batch_info["all_files"] = p_all_files;
+	
+	print_line("AI Chat: 📤 Sending batch " + String::num_int64(p_current_batch) + "/" + String::num_int64(p_total_batches) + " (" + String::num_int64(batch_files.size()) + " files)");
+	
+	_send_embedding_request("index_files", payload);
 }
 
 AIChatDock::~AIChatDock() {

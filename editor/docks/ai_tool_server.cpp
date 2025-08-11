@@ -2,6 +2,7 @@
 #include "editor/ai/editor_tools.h"
 #include "core/io/json.h"
 #include "core/string/string_builder.h"
+#include "core/config/project_settings.h"
 
 void AIToolServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("listen", "port"), &AIToolServer::listen, DEFVAL(8001));
@@ -47,24 +48,8 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 	Dictionary args = request_data.get("arguments", Dictionary());
 	
 	// Handle tool execution
-	if (function_name == "apply_edit") {
-		String path = args.get("path", "");
-		String prompt = args.get("prompt", "");
-		
-		Dictionary apply_args;
-		apply_args["path"] = path;
-		apply_args["prompt"] = prompt;
-		// Pass through any additional AI-provided arguments
-		Array keys = args.keys();
-		for (int i = 0; i < keys.size(); i++) {
-			String key_str = keys[i];
-			if (key_str != "path" && key_str != "prompt") {
-				apply_args[key_str] = args[key_str];
-			}
-		}
-		
-		result = EditorTools::apply_edit(apply_args);
-	} else if (function_name == "list_project_files") {
+	// NOTE: apply_edit is now handled in the backend, not here
+	if (function_name == "list_project_files") {
 		result = EditorTools::list_project_files(args);
 	} else if (function_name == "read_file_content") {
 		result = EditorTools::read_file_content(args);
@@ -158,10 +143,23 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 		result = EditorTools::check_node_in_scene_tree(args);
 	} else if (function_name == "inspect_animation_state") {
 		result = EditorTools::inspect_animation_state(args);
-	} else if (function_name == "get_layers_and_zindex") {
+    } else if (function_name == "get_layers_and_zindex") {
 		result = EditorTools::get_layers_and_zindex(args);
-	} else if (function_name == "search_across_project") {
+    } else if (function_name == "search_across_project") {
+        // Normalize defaults for agent and inject project root
+        if (!args.has("max_results")) {
+            args["max_results"] = 5;
+        }
+        if (!args.has("include_graph")) {
+            args["include_graph"] = true;
+        }
+        // Always include the project root to avoid backend defaulting to old projects
+        String project_root = ProjectSettings::get_singleton()->globalize_path("res://");
+        args["project_root"] = project_root;
+        print_line("AI Tool Server: search_across_project invoking with project_root=" + project_root);
 		result = EditorTools::search_across_project(args);
+	} else if (function_name == "editor_introspect") {
+		result = EditorTools::editor_introspect(args);
 	} else {
 		result["error"] = "Unknown function: " + function_name;
 	}
