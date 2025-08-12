@@ -10,6 +10,7 @@
 #include "editor/editor_data.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
+#include "editor/settings/editor_settings.h"
 #include "core/variant/typed_array.h"
 #include "editor/editor_string_names.h"
 #include "editor/docks/scene_tree_dock.h"
@@ -1447,6 +1448,22 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
     json.instantiate();
     String request_json = json->stringify(request_data);
     
+    // Prepare auth/context headers to mirror chat/image generation
+    String auth_token = String();
+    String user_id = String();
+    if (EditorSettings::get_singleton()->has_setting("ai_chat/auth_token")) {
+        auth_token = EditorSettings::get_singleton()->get_setting("ai_chat/auth_token");
+    }
+    if (EditorSettings::get_singleton()->has_setting("ai_chat/user_id")) {
+        user_id = EditorSettings::get_singleton()->get_setting("ai_chat/user_id");
+    }
+    String machine_id = OS::get_singleton()->get_unique_id();
+    if (machine_id.is_empty()) {
+        machine_id = OS::get_singleton()->get_processor_name() + String("_") + OS::get_singleton()->get_name();
+        machine_id = machine_id.replace(" ", "_").replace("(", "").replace(")", "");
+    }
+    String project_root = ProjectSettings::get_singleton()->globalize_path("res://");
+
     // Write request to temporary file
     String temp_request_path = OS::get_singleton()->get_user_data_dir() + "/temp_request.json";
     String temp_response_path = OS::get_singleton()->get_user_data_dir() + "/temp_response.json";
@@ -1456,8 +1473,14 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
         request_file->store_string(request_json);
         request_file->close();
         
-        // Use curl via OS system call
-        String curl_command = "curl -X POST http://localhost:8000/predict_code_edit -H \"Content-Type: application/json\" -d @\"" + temp_request_path + "\" -o \"" + temp_response_path + "\" -s";
+        // Use curl via OS system call, mirroring headers used by chat/image gen
+        String curl_command = String("curl -X POST http://localhost:8000/predict_code_edit ") +
+            "-H \"Content-Type: application/json\" " +
+            (auth_token.is_empty() ? String("") : String("-H \"Authorization: Bearer ") + auth_token + "\" ") +
+            (user_id.is_empty() ? String("") : String("-H \"X-User-ID: ") + user_id + "\" ") +
+            (machine_id.is_empty() ? String("") : String("-H \"X-Machine-ID: ") + machine_id + "\" ") +
+            (project_root.is_empty() ? String("") : String("-H \"X-Project-Root: ") + project_root + "\" ") +
+            String("-d @\"") + temp_request_path + String("\" -o \"") + temp_response_path + String("\" -s");
         
         print_line("APPLY_EDIT: Executing curl command to backend");
         

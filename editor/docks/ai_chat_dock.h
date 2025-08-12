@@ -188,6 +188,11 @@ private:
 	Mutex *save_mutex = nullptr;
 	bool save_thread_busy = false;
 
+  // Async tool execution tracking (prevents UI freeze for long tools like apply_edit)
+  int pending_tool_tasks = 0;
+  Mutex *apply_edit_mutex = nullptr;
+  Vector<void *> apply_edit_done; // stores ApplyEditTaskData* as opaque pointers
+
 	// Streaming HTTP client (replaces HTTPRequest for streaming support)
 	Ref<HTTPClient> http_client;
 	// Separate HTTP request for stop requests (non-streaming)
@@ -270,6 +275,10 @@ private:
 	void _handle_response_chunk(const PackedByteArray &p_chunk);
 	void _process_ndjson_line(const String &p_line);
 	void _execute_tool_calls(const Array &p_tool_calls);
+  // Async apply_edit helpers
+  void _execute_apply_edit_async(const String &p_tool_call_id, const Dictionary &p_args);
+  static void _apply_edit_thread(void *p_userdata);
+  void _on_apply_edit_thread_done();
 	RichTextLabel *_get_or_create_current_assistant_message_label();
 	void _create_tool_call_bubbles(const Array &p_tool_calls);
 	void _update_tool_placeholder_with_result(const ChatMessage &p_tool_message);

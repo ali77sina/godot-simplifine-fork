@@ -126,6 +126,7 @@ void AIChatDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("_finalize_conversations_save"), &AIChatDock::_finalize_conversations_save);
 	ClassDB::bind_method(D_METHOD("_execute_delayed_save"), &AIChatDock::_execute_delayed_save);
 	ClassDB::bind_method(D_METHOD("_display_generated_image_deferred", "base64_data", "id"), &AIChatDock::_display_generated_image_deferred);
+    ClassDB::bind_method(D_METHOD("_on_apply_edit_thread_done"), &AIChatDock::_on_apply_edit_thread_done);
 	
 	// Embedding system methods
 	ClassDB::bind_method(D_METHOD("_initialize_embedding_system"), &AIChatDock::_initialize_embedding_system);
@@ -510,29 +511,32 @@ void AIChatDock::_notification(int p_notification) {
 					}
 				}
 
-				if (client_status == HTTPClient::STATUS_DISCONNECTED || client_status == HTTPClient::STATUS_CONNECTION_ERROR || client_status == HTTPClient::STATUS_CANT_CONNECT) {
-					if (stream_completed_successfully) {
-						print_line("AI Chat: Stream completed successfully, server closed connection");
-					} else {
-						print_line("AI Chat: HTTP connection failed with status: " + String::num_int64(client_status));
-						_add_message_to_chat("system", "Connection lost or failed (Status: " + String::num_int64(client_status) + ") - Try again please.");
-					}
-					
-					is_waiting_for_response = false;
-					// Clean up stop mechanism state
-					stop_requested = false;
-					current_request_id = "";
-					_update_ui_state();
-					http_status = STATUS_DONE;
-					current_assistant_message_label = nullptr;
-					set_process(false);
-					
-					// CRITICAL: Save conversation when request completes to ensure no data loss
-					if (current_conversation_index >= 0) {
-						conversations.write[current_conversation_index].last_modified_timestamp = _get_timestamp();
-						_queue_delayed_save();
-					}
-				}
+                if (client_status == HTTPClient::STATUS_DISCONNECTED || client_status == HTTPClient::STATUS_CONNECTION_ERROR || client_status == HTTPClient::STATUS_CANT_CONNECT) {
+                    if (stream_completed_successfully) {
+                        print_line("AI Chat: Stream completed successfully, server closed connection");
+                    } else {
+                        print_line("AI Chat: HTTP connection failed with status: " + String::num_int64(client_status));
+                        _add_message_to_chat("system", "Connection lost or failed (Status: " + String::num_int64(client_status) + ") - Try again please.");
+                    }
+
+                    // If we still have async tool tasks running (e.g., apply_edit), keep the UI in 'waiting' state
+                    bool has_async_work = pending_tool_tasks > 0;
+                    is_waiting_for_response = has_async_work ? true : false;
+                    // Clean up stop mechanism state
+                    stop_requested = false;
+                    current_request_id = "";
+                    _update_ui_state();
+                    http_status = STATUS_DONE;
+                    current_assistant_message_label = nullptr;
+                    // Stop HTTP polling; async tasks will resume the chat when done
+                    set_process(false);
+
+                    // CRITICAL: Save conversation when request completes to ensure no data loss
+                    if (current_conversation_index >= 0) {
+                        conversations.write[current_conversation_index].last_modified_timestamp = _get_timestamp();
+                        _queue_delayed_save();
+                    }
+                }
 			}
 		} break;
 		case NOTIFICATION_ENTER_TREE: {
@@ -2272,17 +2276,22 @@ void AIChatDock::_process_ndjson_line(const String &p_line) {
         stream_completed_successfully = true;
         print_line("AI Chat: Server signaled end of stream");
 
-        // Finalize UI/state immediately; some proxies keep the TCP open briefly.
+        // Finalize/save regardless of async state
         if (current_conversation_index >= 0) {
             conversations.write[current_conversation_index].last_modified_timestamp = _get_timestamp();
             _queue_delayed_save();
         }
 
-        is_waiting_for_response = false;
-        stop_requested = false;
-        current_request_id = "";
+        // If async frontend tools (e.g., apply_edit) are still running, keep UI in waiting state
+        bool has_async_work = pending_tool_tasks > 0;
+        is_waiting_for_response = has_async_work ? true : false;
+        // Preserve the last valid request_id if async work is running so the Stop button stays enabled.
+        if (!has_async_work) {
+            stop_requested = false;
+            current_request_id = "";
+        }
         _update_ui_state();
-
+        
         // Ensure the HTTP connection is closed so the poll loop exits promptly.
         if (http_client.is_valid()) {
             http_client->close();
@@ -2603,6 +2612,8 @@ RichTextLabel *AIChatDock::_get_or_create_current_assistant_message_label() {
 }
 
 void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
+    // Ensure counter is sane at the start of a batch
+    if (pending_tool_tasks < 0) pending_tool_tasks = 0;
 	for (int i = 0; i < p_tool_calls.size(); i++) {
 		Dictionary tool_call = p_tool_calls[i];
 		String tool_call_id = tool_call.get("id", "");
@@ -2666,11 +2677,15 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 			result = EditorTools::list_project_files(args);
 		} else if (function_name == "read_file_content") {
 			result = EditorTools::read_file_content(args);
-		} else if (function_name == "read_file_advanced") {
-			result = EditorTools::read_file_advanced(args);
-		} else if (function_name == "apply_edit") {
-			// Use the enhanced EditorTools::apply_edit which returns diff and compilation errors
-			result = EditorTools::apply_edit(args);
+    } else if (function_name == "read_file_advanced") {
+            result = EditorTools::read_file_advanced(args);
+        } else if (function_name == "apply_edit") {
+            // Run apply_edit asynchronously to avoid blocking the UI (curl/OS execute can freeze main thread)
+            pending_tool_tasks++;
+            _update_tool_placeholder_status(tool_call_id, function_name, "running");
+            _execute_apply_edit_async(tool_call_id, args);
+            // Skip immediate result handling; it will be added when the thread completes
+            continue;
 		} else if (function_name == "check_compilation_errors") {
 			result = EditorTools::check_compilation_errors(args);
 		} else if (function_name == "run_scene") {
@@ -2743,14 +2758,83 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 		// _add_message_to_chat("system", status_icon + " " + function_name + ": " + message);
 	}
 
-	// We've finished with this turn's tool calls. Clear the current label
-	// so the next content_delta or assistant_message creates a new bubble
-	// or finds the correct existing one.
-	current_assistant_message_label = nullptr;
-	
-	// Send the conversation with tool results back to backend to continue processing
-	// This is expected by the backend after frontend tool execution
-	_send_chat_request();
+    // If there are async tool tasks running, defer finalization until they complete.
+    if (pending_tool_tasks > 0) {
+        print_line("AI Chat: Waiting for " + String::num_int64(pending_tool_tasks) + " async tool task(s) to finish...");
+        return;
+    }
+
+    // We've finished with this turn's tool calls. Clear the current label
+    // so the next content_delta or assistant_message creates a new bubble
+    // or finds the correct existing one.
+    current_assistant_message_label = nullptr;
+    
+    // Send the conversation with tool results back to backend to continue processing
+    // This is expected by the backend after frontend tool execution
+    _send_chat_request();
+}
+
+// Struct to pass data to apply_edit thread
+struct ApplyEditTaskData {
+    AIChatDock *dock = nullptr;
+    String tool_call_id;
+    Dictionary args;
+    Dictionary result;
+};
+
+void AIChatDock::_execute_apply_edit_async(const String &p_tool_call_id, const Dictionary &p_args) {
+    ApplyEditTaskData *task = memnew(ApplyEditTaskData);
+    task->dock = this;
+    task->tool_call_id = p_tool_call_id;
+    task->args = p_args;
+
+    Thread *t = memnew(Thread);
+    // Detached thread; it will clean itself by calling back into _on_apply_edit_thread_done
+    t->start(_apply_edit_thread, task);
+}
+
+void AIChatDock::_apply_edit_thread(void *p_userdata) {
+    ApplyEditTaskData *task = static_cast<ApplyEditTaskData *>(p_userdata);
+    if (!task || !task->dock) {
+        return;
+    }
+    // Perform the heavy work off the main thread
+    Dictionary result = EditorTools::apply_edit(task->args);
+    task->result = result;
+    // Stash pointer for main thread consumption (deferred)
+    if (!task->dock->apply_edit_mutex) {
+        task->dock->apply_edit_mutex = memnew(Mutex);
+    }
+    task->dock->apply_edit_mutex->lock();
+    task->dock->apply_edit_done.push_back(task);
+    task->dock->apply_edit_mutex->unlock();
+    // Hop back to main thread to update UI/state
+    task->dock->call_deferred("_on_apply_edit_thread_done");
+}
+
+void AIChatDock::_on_apply_edit_thread_done() {
+    // Drain any completed tasks queued by background threads
+    Vector<void *> to_process;
+    if (apply_edit_mutex) apply_edit_mutex->lock();
+    to_process = apply_edit_done;
+    apply_edit_done.clear();
+    if (apply_edit_mutex) apply_edit_mutex->unlock();
+
+    for (int i = 0; i < to_process.size(); i++) {
+        ApplyEditTaskData *task = static_cast<ApplyEditTaskData *>(to_process[i]);
+        if (!task) continue;
+
+        pending_tool_tasks = MAX(0, pending_tool_tasks - 1);
+        const String tool_name = "apply_edit";
+        _update_tool_placeholder_status(task->tool_call_id, tool_name, "completed");
+        _add_tool_response_to_chat(task->tool_call_id, tool_name, task->args, task->result);
+        memdelete(task);
+    }
+
+    if (pending_tool_tasks == 0) {
+        current_assistant_message_label = nullptr;
+        _send_chat_request();
+    }
 }
 
 void AIChatDock::_add_message_to_chat(const String &p_role, const String &p_content, const Array &p_tool_calls) {

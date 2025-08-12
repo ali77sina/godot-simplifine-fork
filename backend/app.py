@@ -1345,7 +1345,9 @@ def chat():
                         }
                     }
                     yield json.dumps(frontend_response) + '\n'
-                    print(f"FRONTEND_PROCESSING: Tool calls sent, breaking from loop")
+                    # Signal graceful end of this stream so the frontend doesn't treat the disconnect as an error.
+                    yield json.dumps({"status": "completed"}) + '\n'
+                    print(f"FRONTEND_PROCESSING: Tool calls sent, closing stream awaiting frontend tool execution")
                     break  # Exit loop after sending tools to frontend
 
                 # If no tools, it's a final text response. Append and break.
