@@ -1554,6 +1554,10 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
             diff = "=== TEMPORARY SIMPLE DIFF ===\nOriginal length: " + String::num_int64(file_content.length()) + " chars\nNew length: " + String::num_int64(cleaned_content.length()) + " chars\n=== END DIFF ===";
         }
 
+        // Check compilation/static errors against the edited content before previewing
+        Array comp_errors = _check_compilation_errors(path, cleaned_content);
+        bool has_errors = comp_errors.size() > 0;
+
         // Do NOT write to disk here. Leave Accept/Reject to the UI layer.
         Dictionary result;
         result["success"] = true;
@@ -1562,8 +1566,8 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
         result["original_content"] = file_content;
         result["edited_content"] = cleaned_content;
         result["diff"] = diff;
-        result["compilation_errors"] = Array();
-        result["has_errors"] = false;
+        result["compilation_errors"] = comp_errors;
+        result["has_errors"] = has_errors;
         result["dynamic_approach"] = false;
         return result;
     }

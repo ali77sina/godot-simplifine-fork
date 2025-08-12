@@ -3855,6 +3855,8 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
         String file_path = p_args.has("path") ? p_args.get("path", "Unknown") : p_args.get("file_path", "Unknown");
         String original_content = p_result.get("original_content", "");
         String edited_content = p_result.get("edited_content", "");
+        Array comp_errors = p_result.get("compilation_errors", Array());
+        bool has_errors = p_result.get("has_errors", false);
 
         ScriptEditor *script_editor = ScriptEditor::get_singleton();
         if (script_editor) {
@@ -3897,9 +3899,34 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
         VBoxContainer *edit_vbox = memnew(VBoxContainer);
         p_content_vbox->add_child(edit_vbox);
         Label *status = memnew(Label);
-        status->set_text("Inline preview ready in Script Editor (Accept/Reject). File: " + file_path);
+        String status_text = "Inline preview ready in Script Editor (Accept/Reject). File: " + file_path;
+        if (has_errors) {
+            status_text += " — Errors detected (" + String::num_int64(comp_errors.size()) + ")";
+        }
+        status->set_text(status_text);
         status->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1,1,1,0.8));
         edit_vbox->add_child(status);
+
+        // If there are errors, show a brief list
+        if (has_errors && comp_errors.size() > 0) {
+            RichTextLabel *errs = memnew(RichTextLabel);
+            errs->set_fit_content(true);
+            errs->set_selection_enabled(true);
+            errs->push_color(get_theme_color(SNAME("warning_color"), SNAME("Editor")));
+            errs->add_text("Problems in edited file:\n");
+            errs->pop();
+            int shown = 0;
+            for (int i = 0; i < comp_errors.size() && shown < 5; i++) {
+                Dictionary e = comp_errors[i];
+                String line = String(e.get("type", "error")) + String(" @ ") + String::num_int64(int64_t(e.get("line", 0))) + ": " + String(e.get("message", ""));
+                errs->add_text("• " + line + "\n");
+                shown++;
+            }
+            if (comp_errors.size() > shown) {
+                errs->add_text("… and more");
+            }
+            edit_vbox->add_child(errs);
+        }
 
 	} else if (p_tool_name == "get_scene_tree_hierarchy" && p_success) {
 		VBoxContainer *hierarchy_vbox = memnew(VBoxContainer);

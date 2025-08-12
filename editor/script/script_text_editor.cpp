@@ -3100,11 +3100,14 @@ void ScriptTextEditor::_apply_all_diff_hunks(bool p_accept) {
 	if (p_accept) {
 		// Apply the modified content (without the header comments)
 		te->set_text(modified_content);
-	} else {
+        // Persist to disk immediately so the editor reflects accepted changes
+        apply_code();
+    } else {
 		// Revert to the original content
 		te->set_text(original_content);
+        // Save the revert so on re-open it matches the old version
+        apply_code();
 	}
-    apply_code();
     // Mark the current buffer as up to date and reset undo history
     te->clear_undo_history();
     te->tag_saved_version();
