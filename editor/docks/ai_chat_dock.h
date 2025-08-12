@@ -150,6 +150,11 @@ private:
 	bool embedding_system_initialized = false;
 	bool initial_indexing_done = false;
 	bool embedding_request_busy = false;
+	// Periodic polling for indexing
+	Timer *embedding_poll_timer = nullptr;
+	int embedding_poll_seconds = 120; // 2 minutes
+	uint64_t last_index_request_ms = 0;
+	bool pending_fs_changes = false;
 	// Embedding progress UI
 	Label *embedding_status_label = nullptr;
 	Timer *embedding_status_timer = nullptr;
@@ -259,6 +264,8 @@ private:
 	void _on_at_mention_item_selected();
 	void _on_model_selected(int p_index);
 	void _on_index_button_pressed();
+    void _on_editor_resource_saved(Object *p_res);
+    void _on_editor_scene_saved(const String &p_path);
 	void _on_tool_output_toggled(Control *p_content);
 	void _on_attachment_menu_item_pressed(int p_id);
 	void _on_attach_files_pressed();
@@ -387,6 +394,7 @@ private:
 	String _get_embed_base_url();
 	void _set_embedding_status(const String &p_text, bool p_busy);
 	void _on_embedding_status_tick();
+	void _on_embedding_poll_tick();
 
 	// Cloud-ready file indexing methods
 	void _scan_and_index_project_files();

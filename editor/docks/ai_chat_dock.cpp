@@ -6538,44 +6538,62 @@ String AIChatDock::get_machine_id() const {
 // ========== EMBEDDING SYSTEM IMPLEMENTATION ==========
 
 void AIChatDock::_initialize_embedding_system() {
-	print_line("AI Chat: 🔧 Initializing cloud-based embedding system");
-	
-	if (!_is_user_authenticated()) {
-		print_line("AI Chat: ❌ Cannot initialize embedding system - user not authenticated");
-		_set_embedding_status("Login required", false);
-		return;
-	}
-	
-	// Create HTTPRequest for embedding API calls
-	if (!embedding_request) {
-		embedding_request = memnew(HTTPRequest);
-		add_child(embedding_request);
-		embedding_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_embedding_request_completed));
-	}
-	
-	// Setup status timer for animated dots
-	if (!embedding_status_timer) {
-		embedding_status_timer = memnew(Timer);
-		embedding_status_timer->set_wait_time(0.5);
-		embedding_status_timer->set_one_shot(false);
-		embedding_status_timer->connect("timeout", callable_mp(this, &AIChatDock::_on_embedding_status_tick));
-		add_child(embedding_status_timer);
-	}
-	
-	embedding_system_initialized = true;
-	_set_embedding_status("Ready to index", false);
-	
-	// Check current index status
-	_send_embedding_request("status");
-	
-	print_line("AI Chat: ✅ Embedding system initialized successfully");
+    print_line("AI Chat: 🔧 Initializing cloud-based embedding system");
+
+    // Connect to editor file system signals for automatic reindexing
+    // This connection does not require authentication; it only sets up callbacks.
+    if (EditorFileSystem::get_singleton()) {
+        EditorFileSystem::get_singleton()->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
+        EditorFileSystem::get_singleton()->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
+        print_line("AI Chat: 🔗 Connected to EditorFileSystem change signals (filesystem_changed, sources_changed)");
+    } else {
+        print_line("AI Chat: ⚠️ EditorFileSystem not ready; change signals not connected");
+    }
+
+    // Connect to precise save signals from EditorNode to index only changed files
+    if (EditorNode::get_singleton()) {
+        if (!EditorNode::get_singleton()->is_connected("resource_saved", callable_mp(this, &AIChatDock::_on_editor_resource_saved))) {
+            EditorNode::get_singleton()->connect("resource_saved", callable_mp(this, &AIChatDock::_on_editor_resource_saved), CONNECT_DEFERRED);
+        }
+        if (!EditorNode::get_singleton()->is_connected("scene_saved", callable_mp(this, &AIChatDock::_on_editor_scene_saved))) {
+            EditorNode::get_singleton()->connect("scene_saved", callable_mp(this, &AIChatDock::_on_editor_scene_saved), CONNECT_DEFERRED);
+        }
+        print_line("AI Chat: 🔗 Connected to EditorNode save signals (resource_saved, scene_saved)");
+    }
+
+    // Create HTTPRequest for embedding API calls
+    if (!embedding_request) {
+        embedding_request = memnew(HTTPRequest);
+        add_child(embedding_request);
+        embedding_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_embedding_request_completed));
+    }
+
+    // Setup status timer for animated dots
+    if (!embedding_status_timer) {
+        embedding_status_timer = memnew(Timer);
+        embedding_status_timer->set_wait_time(0.5);
+        embedding_status_timer->set_one_shot(false);
+        embedding_status_timer->connect("timeout", callable_mp(this, &AIChatDock::_on_embedding_status_tick));
+        add_child(embedding_status_timer);
+    }
+
+    embedding_system_initialized = true;
+    _set_embedding_status("Ready to index", false);
+
+    if (!_is_user_authenticated()) {
+        print_line("AI Chat: ℹ️ Embedding system ready, but user not authenticated (login to enable indexing)");
+        return;
+    }
+
+    // Defer status/indexing to avoid overlapping requests right after init
+    print_line("AI Chat: ✅ Embedding system initialized successfully");
 }
 
 void AIChatDock::_perform_initial_indexing() {
 	print_line("AI Chat: 📚 Starting project indexing...");
 	
 	if (!embedding_system_initialized || !_is_user_authenticated()) {
-		print_line("AI Chat: ❌ Cannot start indexing - system not ready");
+        print_line("AI Chat: ❌ Cannot start indexing - system not ready (initialized=" + String(embedding_system_initialized ? "true" : "false") + ", authed=" + String(_is_user_authenticated() ? "true" : "false") + ")");
 		return;
 	}
 	
@@ -6624,7 +6642,8 @@ void AIChatDock::_send_embedding_request(const String &p_action, const Dictionar
 	headers.push_back("X-User-ID: " + current_user_id);
 	headers.push_back("X-Machine-ID: " + get_machine_id());
 	
-	print_line("AI Chat: 📡 Sending embedding request: " + p_action + " to " + embed_url);
+    print_line("AI Chat: 📡 Sending embedding request: " + p_action + " to " + embed_url +
+        " (project_root=" + _get_project_root_path() + ")");
 	
 	embedding_request_busy = true;
 	Error err = embedding_request->request(embed_url, headers, HTTPClient::METHOD_POST, request_body);
@@ -6725,9 +6744,10 @@ void AIChatDock::_on_embedding_request_completed(int p_result, int p_code, const
 	} else if (action == "status") {
 		Dictionary stats = response.get("stats", Dictionary());
 		int files_indexed = stats.get("files_indexed", 0);
+		int total_chunks = stats.get("total_chunks", 0);
 		
 		if (files_indexed > 0) {
-			String status_text = String::num_int64(files_indexed) + " files indexed";
+			String status_text = String::num_int64(files_indexed) + " files indexed (" + String::num_int64(total_chunks) + " chunks)";
 			_set_embedding_status(status_text, false);
 			initial_indexing_done = true;
 		} else {
@@ -6856,14 +6876,54 @@ void AIChatDock::_remove_file_embedding(const String &p_file_path) {
 }
 
 void AIChatDock::_on_filesystem_changed() {
-	// Called when filesystem changes - could trigger incremental indexing
-	// For now, just log the event
-	print_line("AI Chat: 📁 Filesystem changed - incremental indexing not implemented yet");
+    print_line("AI Chat: 📁 filesystem_changed signal received");
+    // Only rely on per-file saved signals for accuracy; skip project-wide reindex on generic FS changes.
 }
 
 void AIChatDock::_on_sources_changed(bool p_exist) {
-	// Called when source files change
-	print_line("AI Chat: 📝 Sources changed: " + String(p_exist ? "exist" : "removed"));
+    // Called when source files change
+    print_line("AI Chat: 📝 sources_changed signal received (exist=" + String(p_exist ? "true" : "false") + ")");
+    // Do nothing here; precise per-file handlers will trigger indexing.
+}
+
+void AIChatDock::_on_editor_resource_saved(Object *p_res) {
+    if (!p_res) {
+        return;
+    }
+    Ref<Resource> res = Ref<Resource>(Object::cast_to<Resource>(p_res));
+    if (res.is_null()) {
+        return;
+    }
+    String path = res->get_path();
+    if (path.is_empty()) {
+        return;
+    }
+    print_line("AI Chat: 💾 resource_saved -> " + path);
+    if (!embedding_system_initialized || !_is_user_authenticated() || embedding_request_busy) {
+        return;
+    }
+    if (_should_index_file(ProjectSettings::get_singleton()->globalize_path(path))) {
+        Dictionary payload;
+        payload["file_path"] = ProjectSettings::get_singleton()->globalize_path(path);
+        payload["project_root"] = _get_project_root_path();
+        _set_embedding_status("Updating file", true);
+        _send_embedding_request("update_file", payload);
+    }
+}
+
+void AIChatDock::_on_editor_scene_saved(const String &p_path) {
+    print_line("AI Chat: 💾 scene_saved -> " + p_path);
+    if (!embedding_system_initialized || !_is_user_authenticated() || embedding_request_busy) {
+        return;
+    }
+    String abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+    if (_should_index_file(abs_path)) {
+        Dictionary payload;
+        payload["file_path"] = abs_path;
+        payload["project_root"] = _get_project_root_path();
+        _set_embedding_status("Updating file", true);
+        _send_embedding_request("update_file", payload);
+    }
 }
 
 void AIChatDock::_suggest_relevant_files(const String &p_query) {

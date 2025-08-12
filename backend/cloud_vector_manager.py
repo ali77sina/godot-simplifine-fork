@@ -26,11 +26,16 @@ class CloudVectorManager:
     
     # File extensions to index
     TEXT_EXTENSIONS = {
-        '.gd', '.cs', '.cpp', '.h', '.hpp', '.c',  # Code files
-        '.tscn', '.tres', '.godot', '.import',      # Godot files
-        '.cfg', '.ini', '.json', '.xml', '.yaml',   # Config files
-        '.md', '.txt', '.rst',                      # Documentation
-        '.shader', '.gdshader', '.glsl'             # Shaders
+        # Code files
+        '.gd', '.cs', '.cpp', '.h', '.hpp', '.c',
+        # Godot native project/resource/scene formats
+        '.tscn', '.scn', '.tres', '.res', '.godot', '.import', '.gdns', '.gdnlib', '.gdextension',
+        # Config and metadata
+        '.cfg', '.ini', '.json', '.xml', '.yaml', '.yml',
+        # Documentation
+        '.md', '.txt', '.rst',
+        # Shaders
+        '.shader', '.gdshader', '.glsl'
     }
     
     # Extensions to skip entirely
@@ -343,14 +348,20 @@ class CloudVectorManager:
             if results and results[0].file_hash == file_hash:
                 return False  # Already up to date
             
-            # Delete old entries
-            delete_query = f"""
-            DELETE FROM `{self.gcp_project_id}.{self.dataset_id}.{self.table_id}`
-            WHERE user_id = @user_id 
-              AND project_id = @project_id 
-              AND file_path = @file_path
-            """
-            self.bq_client.query(delete_query, job_config=job_config).result()
+            # Delete old entries (may fail while rows are in the streaming buffer)
+            try:
+                delete_query = f"""
+                DELETE FROM `{self.gcp_project_id}.{self.dataset_id}.{self.table_id}`
+                WHERE user_id = @user_id 
+                  AND project_id = @project_id 
+                  AND file_path = @file_path
+                """
+                self.bq_client.query(delete_query, job_config=job_config).result()
+            except Exception as del_err:
+                if "streaming buffer" in str(del_err):
+                    print(f"CloudVector: Skipping delete due to streaming buffer for {rel_path}")
+                else:
+                    print(f"CloudVector: Delete failed for {rel_path}: {del_err}")
             
             # Chunk the content
             chunks = self._chunk_text(content, rel_path)
@@ -404,10 +415,12 @@ class CloudVectorManager:
             'total': 0,
             'indexed': 0,
             'skipped': 0,
-            'failed': 0
+            'failed': 0,
+            'removed': 0
         }
         
         # Walk through project directory
+        current_rel_paths: Set[str] = set()
         for root, dirs, files in os.walk(project_root):
             # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
@@ -420,12 +433,111 @@ class CloudVectorManager:
                     stats['skipped'] += 1
                     continue
                 
+                # Track relative path for later deletion sync
+                try:
+                    rel_path = os.path.relpath(file_path, project_root)
+                except Exception:
+                    rel_path = file
+                current_rel_paths.add(rel_path)
+
+                if force_reindex:
+                    # Ensure prior chunks are removed to rebuild fresh
+                    try:
+                        self._remove_existing_file_chunks(user_id, project_id, rel_path)
+                    except Exception:
+                        pass
+
                 if self.index_file(file_path, user_id, project_id, project_root):
                     stats['indexed'] += 1
                 else:
                     stats['skipped'] += 1
         
+        # After indexing, remove entries for files that no longer exist in the project
+        try:
+            removed_count = self._remove_missing_files(user_id, project_id, current_rel_paths)
+            stats['removed'] = removed_count
+        except Exception as e:
+            print(f"CloudVector: Error during removal of missing files: {e}")
+
         return stats
+
+    def _remove_missing_files(self, user_id: str, project_id: str, current_rel_paths: Set[str]) -> int:
+        """Remove any indexed files that are no longer present in the project.
+
+        Returns number of file entries (distinct paths) removed.
+        """
+        try:
+            # Fetch currently indexed distinct file paths for this project
+            table_ref = f"{self.gcp_project_id}.{self.dataset_id}.{self.table_id}"
+            list_query = f"""
+            SELECT DISTINCT file_path
+            FROM `{table_ref}`
+            WHERE user_id = @user_id AND project_id = @project_id
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                    bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                ]
+            )
+            rows = list(self.bq_client.query(list_query, job_config=job_config).result())
+            indexed_paths = {row.file_path for row in rows}
+
+            to_delete = list(indexed_paths.difference(current_rel_paths))
+            if not to_delete:
+                return 0
+
+            # Delete in batches to avoid parameter limits
+            batch_size = 1000
+            total_removed = 0
+            for i in range(0, len(to_delete), batch_size):
+                batch = to_delete[i:i + batch_size]
+                delete_query = f"""
+                DELETE FROM `{table_ref}`
+                WHERE user_id = @user_id AND project_id = @project_id
+                  AND file_path IN UNNEST(@paths)
+                """
+                del_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                        bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                        bigquery.ArrayQueryParameter("paths", "STRING", batch),
+                    ]
+                )
+                try:
+                    self.bq_client.query(delete_query, job_config=del_config).result()
+                    total_removed += len(batch)
+                except Exception as del_err:
+                    if "streaming buffer" in str(del_err):
+                        print("CloudVector: Skipping removal batch due to streaming buffer")
+                    else:
+                        print(f"CloudVector: Removal batch failed: {del_err}")
+
+            return total_removed
+        except Exception as e:
+            print(f"CloudVector: Failed to remove missing files: {e}")
+            return 0
+
+    def remove_file(self, user_id: str, project_id: str, file_path: str):
+        """Remove all chunks for a specific file from the index."""
+        try:
+            table_ref = f"{self.gcp_project_id}.{self.dataset_id}.{self.table_id}"
+            delete_query = f"""
+            DELETE FROM `{table_ref}`
+            WHERE user_id = @user_id AND project_id = @project_id AND file_path = @file_path
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                    bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                    bigquery.ScalarQueryParameter("file_path", "STRING", file_path),
+                ]
+            )
+            self.bq_client.query(delete_query, job_config=job_config).result()
+            return True
+        except Exception as e:
+            print(f"CloudVector: Error removing file {file_path}: {e}")
+            return False
     
     def search(self, query: str, user_id: str, project_id: str, max_results: int = 10) -> List[Dict]:
         """Search for similar content using BigQuery vector search"""
@@ -442,23 +554,27 @@ class CloudVectorManager:
         search_query = f"""
         WITH query_embedding AS (
             SELECT {query_embedding} AS embedding
+        ), ranked AS (
+            SELECT 
+                e.file_path,
+                e.chunk_index,
+                e.start_line,
+                e.end_line,
+                e.content,
+                (1 - COSINE_DISTANCE(e.embedding, q.embedding)) AS similarity,
+                ROW_NUMBER() OVER (
+                    PARTITION BY e.user_id, e.project_id, e.file_path, e.chunk_index
+                    ORDER BY e.indexed_at DESC
+                ) AS rn
+            FROM `{self.gcp_project_id}.{self.dataset_id}.{self.table_id}` e, query_embedding q
+            WHERE e.user_id = @user_id 
+              AND e.project_id = @project_id
+              AND ARRAY_LENGTH(e.embedding) > 0
         )
-        SELECT 
-            file_path,
-            chunk_index,
-            start_line,
-            end_line,
-            content,
-            (1 - COSINE_DISTANCE(e.embedding, q.embedding)) AS similarity
-        FROM 
-            `{self.gcp_project_id}.{self.dataset_id}.{self.table_id}` e,
-            query_embedding q
-        WHERE 
-            user_id = @user_id 
-            AND project_id = @project_id
-            AND ARRAY_LENGTH(e.embedding) > 0
-        ORDER BY 
-            similarity DESC
+        SELECT file_path, chunk_index, start_line, end_line, content, similarity
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY similarity DESC
         LIMIT @max_results
         """
         
@@ -624,6 +740,26 @@ class CloudVectorManager:
             'skipped': skipped_files,
             'failed': failed_files
         }
+
+    # Compatibility wrapper for provided-content indexing
+    def _create_text_chunks(self, content: str, file_path: str) -> List[TextChunk]:
+        """Create text chunks for a given in-memory file content.
+
+        Dispatches to the same chunking logic as on-disk indexing, using
+        file path to decide strategy.
+        """
+        try:
+            return self._chunk_text(content, file_path)
+        except Exception as e:
+            print(f"CloudVector: _create_text_chunks error for {file_path}: {e}")
+            # Fallback: one whole-chunk to avoid total failure
+            return [TextChunk(
+                file_path=file_path,
+                chunk_index=0,
+                content=content,
+                start_line=1,
+                end_line=len(content.split('\n'))
+            )] if content else []
     
     def _is_file_already_indexed(self, user_id: str, project_id: str, file_path: str, file_hash: str) -> bool:
         """Check if file is already indexed with the same hash"""
@@ -664,5 +800,10 @@ class CloudVectorManager:
                 bigquery.ScalarQueryParameter("file_path", "STRING", file_path),
             ]
         )
-        
-        self.bq_client.query(query, job_config=job_config).result()
+        try:
+            self.bq_client.query(query, job_config=job_config).result()
+        except Exception as del_err:
+            if "streaming buffer" in str(del_err):
+                print(f"CloudVector: Skipping delete for {file_path} due to streaming buffer")
+            else:
+                raise

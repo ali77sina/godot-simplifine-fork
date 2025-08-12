@@ -45,6 +45,7 @@ void AIChatDock::_initialize_embedding_system() {
     if (EditorFileSystem::get_singleton()) {
         EditorFileSystem::get_singleton()->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
         EditorFileSystem::get_singleton()->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
+        print_line("AI Chat: 🔗 Connected to EditorFileSystem change signals (filesystem_changed, sources_changed)");
     }
 
     embedding_system_initialized = true;
@@ -57,30 +58,39 @@ void AIChatDock::_perform_initial_indexing() {
         return;
     }
     Dictionary payload;
-    payload["action"] = "index_project";
     payload["project_root"] = _get_project_root_path();
     payload["force_reindex"] = false;
     // Optional: pass project_id if you have a stable id; backend can derive one otherwise
     // payload["project_id"] = String();
     _set_embedding_status("Indexing project", true);
-    _send_embedding_request("/embed", payload);
+    _send_embedding_request("index_project", payload);
 }
 
 void AIChatDock::_on_filesystem_changed() {
+    print_line("AI Chat: 📁 filesystem_changed signal received");
     // Debounced: simply request a lightweight re-index of project
-    if (!embedding_system_initialized || !_is_user_authenticated() || embedding_request_busy) {
+    if (!embedding_system_initialized) {
+        print_line("AI Chat: 🚫 Skipping indexing - system not initialized");
+        return;
+    }
+    if (!_is_user_authenticated()) {
+        print_line("AI Chat: 🚫 Skipping indexing - user not authenticated");
+        return;
+    }
+    if (embedding_request_busy) {
+        print_line("AI Chat: ⏳ Skipping indexing - previous embedding request still in flight");
         return;
     }
 
     Dictionary payload;
-    payload["action"] = "index_project";
     payload["project_root"] = _get_project_root_path();
     payload["force_reindex"] = false; // backend is incremental
     _set_embedding_status("Indexing changes", true);
-    _send_embedding_request("/embed", payload);
+    _send_embedding_request("index_project", payload);
 }
 
 void AIChatDock::_on_sources_changed(bool p_exist) {
+    print_line("AI Chat: 📝 sources_changed signal received (exist=" + String(p_exist ? "true" : "false") + ")");
     // Sources changed; treat same as filesystem_changed for indexing purposes
     _on_filesystem_changed();
 }
@@ -90,11 +100,10 @@ void AIChatDock::_update_file_embedding(const String &p_file_path) {
         return;
     }
     Dictionary payload;
-    payload["action"] = "update_file";
     payload["project_root"] = _get_project_root_path();
     payload["file_path"] = p_file_path;
     _set_embedding_status("Updating file", true);
-    _send_embedding_request("/embed", payload);
+    _send_embedding_request("update_file", payload);
 }
 
 void AIChatDock::_remove_file_embedding(const String &p_file_path) {
@@ -102,11 +111,10 @@ void AIChatDock::_remove_file_embedding(const String &p_file_path) {
         return;
     }
     Dictionary payload;
-    payload["action"] = "remove_file";
     payload["project_root"] = _get_project_root_path();
     payload["file_path"] = p_file_path;
     _set_embedding_status("Removing file", true);
-    _send_embedding_request("/embed", payload);
+    _send_embedding_request("remove_file", payload);
 }
 
 void AIChatDock::_send_embedding_request(const String &p_path, const Dictionary &p_data) {
@@ -261,12 +269,11 @@ void AIChatDock::_suggest_relevant_files(const String &p_query) {
         return;
     }
     Dictionary payload;
-    payload["action"] = "search";
     payload["project_root"] = _get_project_root_path();
     payload["query"] = p_query;
     payload["k"] = 5;
     payload["include_graph"] = true;
-    _send_embedding_request("/embed", payload);
+    _send_embedding_request("search", payload);
 }
 
 void AIChatDock::_auto_attach_relevant_context() {

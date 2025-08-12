@@ -78,15 +78,18 @@ def verify_authentication():
     if os.getenv('DEV_MODE', 'false').lower() == 'true':
         # Check headers first, then JSON
         user_id = request.headers.get('X-User-ID')
+        data = request.json if request.json else {}
         if not user_id:
-            data = request.json if request.json else {}
             user_id = data.get('user_id')
-        if user_id:
-            print(f"🧪 DEV MODE: Bypassing auth for user {user_id}")
+        # Fallback: derive a dev user from machine_id to allow zero-click local runs
+        machine_id_dev = request.headers.get('X-Machine-ID') or data.get('machine_id')
+        if user_id or machine_id_dev:
+            effective_user = user_id or f"dev_{machine_id_dev}"
+            print(f"🧪 DEV MODE: Bypassing auth for user {effective_user}")
             return {
-                "id": user_id,
-                "name": "Test User",
-                "email": "test@example.com",
+                "id": effective_user,
+                "name": "Dev User",
+                "email": "dev@example.com",
                 "provider": "dev_mode"
             }, None, None
     
@@ -1696,6 +1699,32 @@ def embed_endpoint():
                 "project_id": project_id
             })
         
+        elif action == 'update_file':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for update_file action"}), 400
+
+            # update_file is equivalent to index_file with fresh content check
+            indexed = cloud_vector_manager.index_file(file_path, user['id'], project_id, project_root)
+            return jsonify({
+                "success": True,
+                "action": "update_file",
+                "file_path": file_path,
+                "indexed": indexed
+            })
+
+        elif action == 'remove_file':
+            file_path = data.get('file_path')
+            if not file_path:
+                return jsonify({"error": "file_path required for remove_file action"}), 400
+
+            removed = cloud_vector_manager.remove_file(user['id'], project_id, file_path)
+            return jsonify({
+                "success": removed,
+                "action": "remove_file",
+                "file_path": file_path
+            })
+
         elif action == 'search':
             query = data.get('query')
             if not query:
