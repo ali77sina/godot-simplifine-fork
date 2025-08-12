@@ -6577,6 +6577,17 @@ void AIChatDock::_initialize_embedding_system() {
         add_child(embedding_status_timer);
     }
 
+    // Setup periodic poll timer for background indexing
+    if (!embedding_poll_timer) {
+        embedding_poll_timer = memnew(Timer);
+        embedding_poll_timer->set_wait_time(embedding_poll_seconds);
+        embedding_poll_timer->set_one_shot(false);
+        embedding_poll_timer->connect("timeout", callable_mp(this, &AIChatDock::_on_embedding_poll_tick));
+        add_child(embedding_poll_timer);
+        embedding_poll_timer->start();
+        print_line("AI Chat: ⏱️ Enabled periodic indexing poll every " + String::num_int64(embedding_poll_seconds) + "s");
+    }
+
     embedding_system_initialized = true;
     _set_embedding_status("Ready to index", false);
 
@@ -6878,6 +6889,7 @@ void AIChatDock::_remove_file_embedding(const String &p_file_path) {
 void AIChatDock::_on_filesystem_changed() {
     print_line("AI Chat: 📁 filesystem_changed signal received");
     // Only rely on per-file saved signals for accuracy; skip project-wide reindex on generic FS changes.
+    pending_fs_changes = true;
 }
 
 void AIChatDock::_on_sources_changed(bool p_exist) {
@@ -6899,30 +6911,66 @@ void AIChatDock::_on_editor_resource_saved(Object *p_res) {
         return;
     }
     print_line("AI Chat: 💾 resource_saved -> " + path);
-    if (!embedding_system_initialized || !_is_user_authenticated() || embedding_request_busy) {
-        return;
-    }
-    if (_should_index_file(ProjectSettings::get_singleton()->globalize_path(path))) {
-        Dictionary payload;
-        payload["file_path"] = ProjectSettings::get_singleton()->globalize_path(path);
-        payload["project_root"] = _get_project_root_path();
-        _set_embedding_status("Updating file", true);
-        _send_embedding_request("update_file", payload);
+    // Always queue for periodic batch to avoid immediate requests
+    String abs_path_res = ProjectSettings::get_singleton()->globalize_path(path);
+    if (_should_index_file(abs_path_res)) {
+        pending_changed_files.insert(abs_path_res);
+        pending_fs_changes = true;
+        // Optional: surface status as queued (non-blocking)
+        _set_embedding_status("Queued file for indexing", false);
     }
 }
 
 void AIChatDock::_on_editor_scene_saved(const String &p_path) {
     print_line("AI Chat: 💾 scene_saved -> " + p_path);
+    // Always queue for periodic batch to avoid immediate requests
+    String abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
+    if (_should_index_file(abs_path)) {
+        pending_changed_files.insert(abs_path);
+        pending_fs_changes = true;
+        _set_embedding_status("Queued file for indexing", false);
+    }
+}
+
+void AIChatDock::_on_embedding_poll_tick() {
     if (!embedding_system_initialized || !_is_user_authenticated() || embedding_request_busy) {
         return;
     }
-    String abs_path = ProjectSettings::get_singleton()->globalize_path(p_path);
-    if (_should_index_file(abs_path)) {
+    // Prefer batching changed files; otherwise do lightweight incremental project scan
+    if (!pending_changed_files.is_empty()) {
+        // Batch changed files using cloud-ready endpoint to minimize requests
+        Array files_arr;
+        for (const String &abs_path : pending_changed_files) {
+            // Read file contents and hash (same as bulk flow)
+            Dictionary file_data = _read_file_for_indexing(abs_path, _get_project_root_path());
+            if (!file_data.is_empty()) {
+                files_arr.push_back(file_data);
+            }
+        }
+        pending_changed_files.clear();
+        if (!files_arr.is_empty()) {
+            Dictionary payload;
+            payload["files"] = files_arr;
+            Dictionary batch_info;
+            batch_info["current"] = 1;
+            batch_info["total"] = 1;
+            batch_info["files_in_batch"] = files_arr.size();
+            payload["batch_info"] = batch_info;
+            _set_embedding_status("Indexing changed files", true);
+            _send_embedding_request("index_files", payload);
+            last_index_request_ms = OS::get_singleton()->get_ticks_msec();
+            return;
+        }
+    }
+    // If there were FS changes but nothing queued, do an incremental project index
+    if (pending_fs_changes) {
         Dictionary payload;
-        payload["file_path"] = abs_path;
         payload["project_root"] = _get_project_root_path();
-        _set_embedding_status("Updating file", true);
-        _send_embedding_request("update_file", payload);
+        payload["force_reindex"] = false;
+        _set_embedding_status("Indexing changes", true);
+        _send_embedding_request("index_project", payload);
+        last_index_request_ms = OS::get_singleton()->get_ticks_msec();
+        pending_fs_changes = false;
     }
 }
 

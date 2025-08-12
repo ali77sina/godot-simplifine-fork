@@ -155,6 +155,8 @@ private:
 	int embedding_poll_seconds = 120; // 2 minutes
 	uint64_t last_index_request_ms = 0;
 	bool pending_fs_changes = false;
+	// Accumulate changed files for periodic batching
+	HashSet<String> pending_changed_files;
 	// Embedding progress UI
 	Label *embedding_status_label = nullptr;
 	Timer *embedding_status_timer = nullptr;
