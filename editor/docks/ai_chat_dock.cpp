@@ -540,14 +540,32 @@ void AIChatDock::_notification(int p_notification) {
 			}
 		} break;
 		case NOTIFICATION_ENTER_TREE: {
-			// Load API key from editor settings
+    // Load API key from editor settings
 			if (EditorSettings::get_singleton()->has_setting("ai_chat/api_key")) {
 				api_key = EditorSettings::get_singleton()->get_setting("ai_chat/api_key");
 			}
+    // Resolve API endpoint based on environment
+    String is_dev = OS::get_singleton()->get_environment("IS_DEV");
+    if (is_dev.is_empty()) {
+        // Backward-compat with DEV_MODE
+        is_dev = OS::get_singleton()->get_environment("DEV_MODE");
+    }
+    if (!is_dev.is_empty() && is_dev.to_lower() == "true") {
+        api_endpoint = "http://127.0.0.1:8000/chat";
+    } else {
+        api_endpoint = "https://gamechat.simplifine.com/chat";
+    }
 		} break;
 			case NOTIFICATION_READY: {
 			// Auto-verify saved authentication when everything is fully ready
 			_auto_verify_saved_credentials();
+			// Debug: Log environment mode and resolved endpoint
+			String is_dev_env = OS::get_singleton()->get_environment("IS_DEV");
+			if (is_dev_env.is_empty()) {
+				is_dev_env = OS::get_singleton()->get_environment("DEV_MODE");
+			}
+			String mode = (!is_dev_env.is_empty() && is_dev_env.to_lower() == "true") ? String("DEV") : String("PROD");
+			print_line("AI Chat: Launch mode=" + mode + ", endpoint=" + api_endpoint);
 		} break;
 			case NOTIFICATION_EXIT_TREE: {
 				// Final flush save to ensure no data loss on exit
@@ -663,46 +681,56 @@ void AIChatDock::_on_stop_request_completed(int p_result, int p_code, const Pack
 }
 
 void AIChatDock::_on_edit_message_pressed(int p_message_index) {
-	print_line("AI Chat: Edit button pressed for message index: " + String::num(p_message_index));
-	
-	Vector<AIChatDock::ChatMessage> &chat_history = _get_current_chat_history();
-	print_line("AI Chat: Chat history size: " + String::num(chat_history.size()));
-	
-	if (p_message_index < 0 || p_message_index >= chat_history.size()) {
-		print_line("AI Chat: Invalid message index for editing: " + String::num(p_message_index));
-		return;
-	}
-	
-	ChatMessage &message = chat_history.write[p_message_index];
-	if (message.role != "user") {
-		print_line("AI Chat: Can only edit user messages, but got role: " + message.role);
-		return;
-	}
-	
-	print_line("AI Chat: Editing message at index " + String::num(p_message_index) + ": " + message.content);
-	
-	// Find the corresponding UI element in chat_container
-	// Each message creates 2 children: spacer + message_panel
-	// So message at index i should be at UI child index (i * 2 + 1) if there are spacers
-	// But since the first message doesn't have a spacer, it's more complex
-	// Let's just rebuild the UI to be safe
-	
-	// Clear chat UI and rebuild in edit mode
-	for (int i = 0; i < chat_container->get_child_count(); i++) {
-		Node *child = chat_container->get_child(i);
-		child->queue_free();
-	}
-	
-	// Rebuild conversation UI but with edit mode for the selected message
-	for (int i = 0; i < chat_history.size(); i++) {
-		if (i == p_message_index) {
-			_create_edit_message_bubble(chat_history[i], i);
-		} else {
-			_create_message_bubble(chat_history[i], i);
-		}
-	}
-	
-	call_deferred("_scroll_to_bottom");
+    print_line("AI Chat: Edit button pressed for message index: " + String::num(p_message_index));
+
+    Vector<AIChatDock::ChatMessage> &chat_history = _get_current_chat_history();
+    if (p_message_index < 0 || p_message_index >= chat_history.size()) {
+        print_line("AI Chat: Invalid message index for editing: " + String::num(p_message_index));
+        return;
+    }
+
+    ChatMessage &message = chat_history.write[p_message_index];
+    if (message.role != "user") {
+        print_line("AI Chat: Can only edit user messages, but got role: " + message.role);
+        return;
+    }
+
+    // Replace only the selected message panel to avoid O(n) rebuilds and extra allocations.
+    if (!chat_container) {
+        return;
+    }
+    Node *node = chat_container->find_child("message_panel_" + String::num_int64(p_message_index), true, false);
+    PanelContainer *old_panel = Object::cast_to<PanelContainer>(node);
+    if (!old_panel) {
+        // Fallback to rebuild if we cannot find the targeted panel.
+        for (int i = 0; i < chat_container->get_child_count(); i++) {
+            Node *child = chat_container->get_child(i);
+            child->queue_free();
+        }
+        for (int i = 0; i < chat_history.size(); i++) {
+            if (i == p_message_index) {
+                _create_edit_message_bubble(chat_history[i], i);
+            } else {
+                _create_message_bubble(chat_history[i], i);
+            }
+        }
+        call_deferred("_scroll_to_bottom");
+        return;
+    }
+
+    // Build the edit panel and swap it in-place preserving index order.
+    PanelContainer *edit_panel = _build_edit_message_panel(message, p_message_index);
+    if (!edit_panel) {
+        return;
+    }
+    Node *parent = old_panel->get_parent();
+    int old_index = old_panel->get_index();
+    parent->remove_child(old_panel);
+    old_panel->queue_free();
+    parent->add_child(edit_panel);
+    parent->move_child(edit_panel, old_index);
+
+    call_deferred("_scroll_to_bottom");
 }
 
 void AIChatDock::_create_edit_message_bubble(const AIChatDock::ChatMessage &p_message, int p_message_index) {
@@ -774,6 +802,58 @@ void AIChatDock::_create_edit_message_bubble(const AIChatDock::ChatMessage &p_me
 	
 	// Focus the edit field
 	edit_field->grab_focus();
+}
+
+PanelContainer *AIChatDock::_build_edit_message_panel(const AIChatDock::ChatMessage &p_message, int p_message_index) {
+    PanelContainer *message_panel = memnew(PanelContainer);
+    if (p_message_index >= 0) {
+        message_panel->set_name("message_panel_" + String::num_int64(p_message_index));
+    }
+
+    Ref<StyleBoxFlat> panel_style = memnew(StyleBoxFlat);
+    panel_style->set_content_margin_all(12);
+    panel_style->set_corner_radius_all(8);
+    panel_style->set_bg_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.15));
+    panel_style->set_border_width_all(2);
+    panel_style->set_border_color(get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+    message_panel->add_theme_style_override("panel", panel_style);
+
+    VBoxContainer *message_vbox = memnew(VBoxContainer);
+    message_panel->add_child(message_vbox);
+
+    Label *role_label = memnew(Label);
+    role_label->add_theme_font_override("font", get_theme_font(SNAME("bold"), SNAME("EditorFonts")));
+    role_label->set_text("User (Editing)");
+    role_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")));
+    message_vbox->add_child(role_label);
+
+    TextEdit *edit_field = memnew(TextEdit);
+    edit_field->set_text(p_message.content);
+    edit_field->set_custom_minimum_size(Size2(0, 100));
+    edit_field->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+    message_vbox->add_child(edit_field);
+
+    HBoxContainer *button_container = memnew(HBoxContainer);
+    message_vbox->add_child(button_container);
+
+    Button *send_button = memnew(Button);
+    send_button->set_text("Send");
+    send_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Play"), SNAME("EditorIcons")));
+    send_button->set_meta("edit_field", edit_field);
+    send_button->set_meta("message_index", p_message_index);
+    send_button->connect("pressed", callable_mp(this, &AIChatDock::_on_edit_send_button_pressed).bind(send_button));
+    button_container->add_child(send_button);
+
+    edit_field->connect("gui_input", callable_mp(this, &AIChatDock::_on_edit_field_gui_input).bind(send_button));
+
+    Button *cancel_button = memnew(Button);
+    cancel_button->set_text("Cancel");
+    cancel_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Stop"), SNAME("EditorIcons")));
+    cancel_button->connect("pressed", callable_mp(this, &AIChatDock::_on_edit_message_cancel_pressed).bind(p_message_index));
+    button_container->add_child(cancel_button);
+
+    edit_field->grab_focus();
+    return message_panel;
 }
 
 void AIChatDock::_on_edit_send_button_pressed(Button *p_button) {
@@ -3063,7 +3143,11 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 		chat_container->add_child(spacer);
 	}
 	
-	chat_container->add_child(message_panel);
+    chat_container->add_child(message_panel);
+    // Name the panel with its message index for easy lookup/replacement later.
+    if (p_message_index >= 0) {
+        message_panel->set_name("message_panel_" + String::num_int64(p_message_index));
+    }
 
 	// Default to invisible. We'll show it only if it has content.
 	message_panel->set_visible(false);
@@ -3104,17 +3188,15 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 	role_label->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	role_container->add_child(role_label);
 	
-	// Add edit button for user messages only
-	if (p_message.role == "user" && p_message_index >= 0) {
-		print_line("AI Chat: Creating edit button for user message at index: " + String::num(p_message_index));
-		Button *edit_button = memnew(Button);
+    // Add edit button for user messages only
+    if (p_message.role == "user" && p_message_index >= 0) {
+        Button *edit_button = memnew(Button);
 		edit_button->set_text("Edit");
 		edit_button->set_custom_minimum_size(Size2(50, 20));
 		edit_button->add_theme_icon_override("icon", get_theme_icon(SNAME("Edit"), SNAME("EditorIcons")));
 		
 		edit_button->connect("pressed", callable_mp(this, &AIChatDock::_on_edit_message_pressed).bind(p_message_index));
 		role_container->add_child(edit_button);
-		print_line("AI Chat: Edit button created and connected for index: " + String::num(p_message_index));
 	}
 
 	// Always create a content label for assistant to allow streaming.
@@ -3241,10 +3323,7 @@ void AIChatDock::_create_message_bubble(const AIChatDock::ChatMessage &p_message
 	// Clear the displayed images set for next message
 	current_displayed_images.clear();
 
-	// Add spacing after each message panel
-	Control *spacer = memnew(Control);
-	spacer->set_custom_minimum_size(Size2(0, 10));
-	chat_container->add_child(spacer);
+    // Single spacing strategy handled before each message; avoid adding an extra trailing spacer per message.
 }
 
 void AIChatDock::_create_tool_call_bubbles(const Array &p_tool_calls) {
@@ -4940,7 +5019,8 @@ void AIChatDock::set_model(const String &p_model) {
 
 void AIChatDock::_save_layout_to_config(Ref<ConfigFile> p_layout, const String &p_section) const {
     // Force saving local endpoint during development
-    p_layout->set_value(p_section, "api_endpoint", String("http://127.0.0.1:8000/chat"));
+    // Persist the resolved endpoint for UX; will be recalculated next session as well
+    p_layout->set_value(p_section, "api_endpoint", api_endpoint);
     p_layout->set_value(p_section, "model", model);
 }
 

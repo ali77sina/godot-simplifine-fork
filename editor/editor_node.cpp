@@ -8364,7 +8364,8 @@ EditorNode::EditorNode() {
     ai_chat_dock = memnew(AIChatDock);
     // Force local backend during development; comment out cloud URL
     // ai_chat_dock->set_api_endpoint("https://gamechat.simplifine.com/chat");
-    ai_chat_dock->set_api_endpoint("http://127.0.0.1:8000/chat");
+    // AIChatDock resolves its endpoint based on IS_DEV/DEV_MODE; no hardcoded override here
+    // ai_chat_dock->set_api_endpoint("http://127.0.0.1:8000/chat");
 
 	// Scene: Top left.
 	editor_dock_manager->add_dock(SceneTreeDock::get_singleton(), TTRC("Scene"), EditorDockManager::DOCK_SLOT_LEFT_UR, ED_SHORTCUT_AND_COMMAND("docks/open_scene", TTRC("Open Scene Dock")), "PackedScene");

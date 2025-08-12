@@ -146,9 +146,18 @@ void ScriptTextEditor::apply_code() {
 	if (script.is_null()) {
 		return;
 	}
+    // If a diff preview is active, treat save as accepting the diff.
+    if (has_pending_diffs) {
+        CodeEdit *te_local = code_editor->get_text_editor();
+        te_local->set_editable(true);
+    }
 	script->set_source_code(code_editor->get_text_editor()->get_text());
 	script->update_exports();
 	code_editor->get_text_editor()->get_syntax_highlighter()->update_cache();
+    if (has_pending_diffs) {
+        // Saving should exit diff mode so the editor returns to normal state.
+        _clear_diff_data();
+    }
 }
 
 Ref<Resource> ScriptTextEditor::get_edited_resource() const {
@@ -160,6 +169,9 @@ void ScriptTextEditor::set_edited_resource(const Ref<Resource> &p_res) {
 	ERR_FAIL_COND(p_res.is_null());
 
 	script = p_res;
+
+    // Reset any previous inline diff state when switching the edited resource
+    _clear_diff_data();
 
 	code_editor->get_text_editor()->set_text(script->get_source_code());
 	code_editor->get_text_editor()->clear_undo_history();
@@ -690,6 +702,10 @@ void ScriptTextEditor::convert_indent() {
 void ScriptTextEditor::tag_saved_version() {
 	code_editor->get_text_editor()->tag_saved_version();
 	edited_file_data.last_modified_time = FileAccess::get_modified_time(edited_file_data.path);
+    // Ensure no lingering diff after explicit save operations
+    if (has_pending_diffs) {
+        _clear_diff_data();
+    }
 }
 
 void ScriptTextEditor::goto_line(int p_line, int p_column) {
@@ -3016,93 +3032,63 @@ public:
 // Simple unified diff viewer - no live editing, just static comparison
 void ScriptTextEditor::set_diff(const String &p_original_content, const String &p_modified_content) {
 	_clear_diff_data();
-
-	original_content = p_original_content;
-	modified_content = p_modified_content;
+    // Normalize line endings to avoid false positives where entire file appears changed.
+    original_content = p_original_content.replace("\r\n", "\n");
+    modified_content = p_modified_content.replace("\r\n", "\n");
 
 	if (original_content == modified_content) {
 		return;
 	}
 
-	_show_unified_diff(original_content, modified_content);
-	_show_diff_toolbar();
+    _show_unified_diff(original_content, modified_content);
+    _show_diff_toolbar();
 	has_pending_diffs = true;
 }
 
 void ScriptTextEditor::_show_unified_diff(const String &p_original, const String &p_modified) {
-	// Show the complete modified file with change indicators
-	Vector<String> original_lines = p_original.split("\n");
-	Vector<String> modified_lines = p_modified.split("\n");
-	
-	// Simple line-by-line comparison to identify changes
-	Vector<int> changed_lines;
-	Vector<int> added_lines;
-	Vector<int> removed_lines;
-	
-	// For now, use a simple approach: show the modified content and highlight different lines
-	// This could be enhanced with a proper diff algorithm later if needed
-	
-	for (int i = 0; i < modified_lines.size(); i++) {
-		if (i >= original_lines.size()) {
-			// Line was added
-			added_lines.push_back(i);
-		} else if (original_lines[i] != modified_lines[i]) {
-			// Line was changed
-			changed_lines.push_back(i);
-		}
-	}
-	
-	// Find removed lines (lines that exist in original but not in modified)
-	for (int i = modified_lines.size(); i < original_lines.size(); i++) {
-		removed_lines.push_back(i);
-	}
-	
-	// Set the complete modified content in read-only mode
-	CodeEdit *te = code_editor->get_text_editor();
-	te->set_text(modified_content);
-	te->set_editable(false);  // Make it read-only
-	
-	// Color the changed lines
-	Color changed_color = Color(0.2, 0.7, 0.2, 0.3);  // Green for modified/added lines
-	Color added_color = Color(0.1, 0.8, 0.1, 0.4);    // Brighter green for new lines
-	
-	// Highlight added lines
-	for (int line_num : added_lines) {
-		if (line_num < te->get_line_count()) {
-			te->set_line_background_color(line_num, added_color);
-		}
-	}
-	
-	// Highlight changed lines  
-	for (int line_num : changed_lines) {
-		if (line_num < te->get_line_count()) {
-			te->set_line_background_color(line_num, changed_color);
-		}
-	}
-	
-	// Add a comment at the top to show it's a diff view
-	String header_comment = "// === AI CODE CHANGES PREVIEW ===\n// Green highlights show modified/added lines\n// Use Accept/Reject buttons below to apply changes\n\n";
-	te->set_text(header_comment + modified_content);
-	
-	// Update the highlighting to account for the header
-	Color header_color = Color(0.5, 0.5, 0.8, 0.2);
-	for (int i = 0; i < 4; i++) {  // Header is 4 lines
-		te->set_line_background_color(i, header_color);
-	}
-	
-	// Adjust line numbers for the highlighting (offset by header)
-	int header_offset = 4;
-	for (int line_num : added_lines) {
-		if (line_num + header_offset < te->get_line_count()) {
-			te->set_line_background_color(line_num + header_offset, added_color);
-		}
-	}
-	
-	for (int line_num : changed_lines) {
-		if (line_num + header_offset < te->get_line_count()) {
-			te->set_line_background_color(line_num + header_offset, changed_color);
-		}
-	}
+    // Show the complete modified file with change indicators
+    Vector<String> original_lines = p_original.split("\n");
+    Vector<String> modified_lines = p_modified.split("\n");
+
+    CodeEdit *te = code_editor->get_text_editor();
+    // Set content once
+    te->set_text(modified_content);
+    // Read-only during preview
+    te->set_editable(false);
+
+    // Clear any previous background colors
+    for (int i = 0; i < te->get_line_count(); i++) {
+        te->set_line_background_color(i, Color(0, 0, 0, 0));
+    }
+
+    // Compute highlights: changed lines (within overlap) and added lines (beyond original)
+    const int overlap = MIN(original_lines.size(), modified_lines.size());
+    Vector<int> changed_lines;
+    Vector<int> added_lines;
+
+    for (int i = 0; i < overlap; i++) {
+        if (original_lines[i] != modified_lines[i]) {
+            changed_lines.push_back(i);
+        }
+    }
+    for (int i = overlap; i < modified_lines.size(); i++) {
+        added_lines.push_back(i);
+    }
+
+    // Colors
+    const Color changed_color = Color(0.2, 0.6, 1.0, 0.25); // Blue-ish for modified lines
+    const Color added_color = Color(0.1, 0.8, 0.1, 0.30);   // Green for new lines
+
+    for (int line_num : changed_lines) {
+        if (line_num < te->get_line_count()) {
+            te->set_line_background_color(line_num, changed_color);
+        }
+    }
+    for (int line_num : added_lines) {
+        if (line_num < te->get_line_count()) {
+            te->set_line_background_color(line_num, added_color);
+        }
+    }
 }
 
 void ScriptTextEditor::_apply_all_diff_hunks(bool p_accept) {
@@ -3118,8 +3104,13 @@ void ScriptTextEditor::_apply_all_diff_hunks(bool p_accept) {
 		// Revert to the original content
 		te->set_text(original_content);
 	}
-	apply_code();
-	_clear_diff_data();
+    apply_code();
+    // Mark the current buffer as up to date and reset undo history
+    te->clear_undo_history();
+    te->tag_saved_version();
+
+    // Ensure we fully reset diff state and highlights so later file opens are clean
+    _clear_diff_data();
 }
 
 void ScriptTextEditor::_clear_diff_data() {

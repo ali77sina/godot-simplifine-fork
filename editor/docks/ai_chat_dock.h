@@ -220,8 +220,7 @@ private:
 	Vector<AttachedFile> current_attached_files;
 	String conversations_file_path;
 	String api_key;
-    // Use local backend during development; switch to cloud URL for production
-	//     String api_endpoint = "https://gamechat.simplifine.com/chat";
+    // Default API endpoint; will be overridden at runtime based on IS_DEV env
     String api_endpoint = "http://127.0.0.1:8000/chat";
 	String model = "gpt-4o";
 
@@ -247,6 +246,9 @@ private:
 	void _on_edit_send_button_pressed(Button *p_button);
 	void _on_edit_message_cancel_pressed(int p_message_index);
 	void _on_edit_field_gui_input(const Ref<InputEvent> &p_event, Button *p_send_button);
+  // Build-only helper that constructs an edit bubble panel for a message without
+  // adding spacers or attaching it to the chat container.
+  PanelContainer *_build_edit_message_panel(const ChatMessage &p_message, int p_message_index);
 	void _create_edit_message_bubble(const ChatMessage &p_message, int p_message_index);
 	void _save_conversations_async();
 	void _on_input_text_changed();

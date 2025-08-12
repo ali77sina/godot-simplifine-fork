@@ -19,7 +19,14 @@ static String _get_backend_base_url(const String &p_chat_endpoint) {
 
 String AIChatDock::_get_embed_base_url() {
     // Force local backend for development
-    return String("http://127.0.0.1:8000");
+    String is_dev = OS::get_singleton()->get_environment("IS_DEV");
+    if (is_dev.is_empty()) {
+        is_dev = OS::get_singleton()->get_environment("DEV_MODE");
+    }
+    if (!is_dev.is_empty() && is_dev.to_lower() == "true") {
+        return String("http://127.0.0.1:8000");
+    }
+    return String("https://gamechat.simplifine.com");
 }
 
 void AIChatDock::_initialize_embedding_system() {
