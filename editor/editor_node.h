@@ -92,6 +92,7 @@ class EditorTitleBar;
 class ExportTemplateManager;
 class EditorQuickOpenDialog;
 class FBXImporterManager;
+class AIChatDock;
 class FileSystemDock;
 class HistoryDock;
 class OrphanResourcesDialog;
@@ -266,6 +267,7 @@ private:
 	EditorSelection *editor_selection = nullptr;
 	EditorSettingsDialog *editor_settings_dialog = nullptr;
 	HistoryDock *history_dock = nullptr;
+	AIChatDock *ai_chat_dock = nullptr;
 
 	ProjectExportDialog *project_export = nullptr;
 	ProjectSettingsEditor *project_settings_editor = nullptr;

@@ -37,6 +37,7 @@
 #include "scene/gui/rich_text_label.h"
 
 class UndoRedo;
+class AIChatDock;
 
 class EditorLog : public HBoxContainer {
 	GDCLASS(EditorLog, HBoxContainer);
@@ -142,6 +143,9 @@ private:
 	// Reference to the "Output" button on the toolbar so we can update its icon when warnings or errors are encountered.
 	Button *tool_button = nullptr;
 
+	// Reference to the AI Chat dock for "Fix with AI" functionality
+	AIChatDock *ai_chat_dock = nullptr;
+
 	bool is_loading_state = false; // Used to disable saving requests while loading (some signals from buttons will try to trigger a save, which happens during loading).
 	Timer *save_state_timer = nullptr;
 
@@ -181,6 +185,7 @@ protected:
 public:
 	void add_message(const String &p_msg, MessageType p_type = MSG_TYPE_STD);
 	void set_tool_button(Button *p_tool_button);
+	void set_ai_chat_dock(AIChatDock *p_ai_chat_dock);
 	void register_undo_redo(UndoRedo *p_undo_redo);
 	void deinit();
 

@@ -1018,7 +1018,7 @@ void EditorFileDialog::update_file_list() {
 
 	dir_access->list_dir_begin();
 
-	List<FileInfo> file_infos;
+	List<EditorFileInfo> file_infos;
 	List<String> dirs;
 
 	String item = dir_access->get_next();
@@ -1034,7 +1034,7 @@ void EditorFileDialog::update_file_list() {
 			matches_search = item.find(search_string) != -1;
 		}
 
-		FileInfo file_info;
+		EditorFileInfo file_info;
 		file_info.name = item;
 		file_info.path = cdir.path_join(file_info.name);
 		file_info.type = item.get_extension();
@@ -1135,7 +1135,7 @@ void EditorFileDialog::update_file_list() {
 	while (!file_infos.is_empty()) {
 		bool match = patterns.is_empty();
 
-		FileInfo file_info = file_infos.front()->get();
+		EditorFileInfo file_info = file_infos.front()->get();
 		for (const String &E : patterns) {
 			if (file_info.name.matchn(E)) {
 				match = true;

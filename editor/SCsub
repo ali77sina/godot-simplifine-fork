@@ -90,6 +90,8 @@ if env.editor_build:
     SConscript("animation/SCsub")
     SConscript("asset_library/SCsub")
     SConscript("audio/SCsub")
+    SConscript("ai/SCsub")
+    SConscript("../thirdparty/dtl/SCsub")
     SConscript("debugger/SCsub")
     SConscript("doc/SCsub")
     SConscript("docks/SCsub")
@@ -113,3 +115,13 @@ if env.editor_build:
 
     lib = env.add_library("editor", env.editor_sources)
     env.Prepend(LIBS=[lib])
+
+env.Append(CPPPATH=["#editor"])
+env.Append(CPPPATH=["#editor/import/3d"])
+env.Append(CPPPATH=["#editor/import/3d/collada"])
+env.Append(CPPPATH=["#thirdparty/tinyusdz"])
+env.Append(CPPPATH=["#thirdparty/rtmidi"])
+env.Append(CPPPATH=["#thirdparty/oidn/include"])
+env.Append(CPPPATH=["#thirdparty/dtl/dtl"])
+
+env.Append(CPPFLAGS=["-DEDITOR_ENABLED"])

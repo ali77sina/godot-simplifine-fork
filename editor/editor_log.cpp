@@ -33,6 +33,7 @@
 #include "core/object/undo_redo.h"
 #include "core/os/keyboard.h"
 #include "core/version.h"
+#include "editor/docks/ai_chat_dock.h"
 #include "editor/editor_node.h"
 #include "editor/editor_string_names.h"
 #include "editor/file_system/editor_paths.h"
@@ -196,7 +197,21 @@ void EditorLog::_load_state() {
 }
 
 void EditorLog::_meta_clicked(const String &p_meta) {
-	OS::get_singleton()->shell_open(p_meta);
+	if (p_meta.begins_with("fix_with_ai:")) {
+		// Extract the error text from the meta data
+		String error_text = p_meta.trim_prefix("fix_with_ai:");
+		if (ai_chat_dock && !error_text.is_empty()) {
+			// Send the error to AI chat for fixing
+			String prompt = "Please help me fix this error:\n\n" + error_text;
+			ai_chat_dock->send_error_message(prompt);
+			print_line("AI Chat: Sent error message for fixing: " + error_text);
+		} else {
+			print_line("AI Chat: Unable to send error - AI Chat dock not available or empty error text");
+		}
+	} else {
+		// Handle regular URL/meta clicks
+		OS::get_singleton()->shell_open(p_meta);
+	}
 }
 
 void EditorLog::_clear_request() {
@@ -256,6 +271,10 @@ void EditorLog::add_message(const String &p_msg, MessageType p_type) {
 
 void EditorLog::set_tool_button(Button *p_tool_button) {
 	tool_button = p_tool_button;
+}
+
+void EditorLog::set_ai_chat_dock(AIChatDock *p_ai_chat_dock) {
+	ai_chat_dock = p_ai_chat_dock;
 }
 
 void EditorLog::register_undo_redo(UndoRedo *p_undo_redo) {
@@ -389,6 +408,20 @@ void EditorLog::_add_log_line(LogMessage &p_message, bool p_replace_previous) {
 	} else {
 		log->add_text(p_message.text);
 	}
+
+	// Add "Fix with AI" link for error and warning messages
+	if (ai_chat_dock && (p_message.type == MSG_TYPE_ERROR || p_message.type == MSG_TYPE_WARNING)) {
+		log->add_text(" ");
+		log->push_color(Color(0.5, 0.8, 1.0)); // Light blue color for the link
+		log->push_underline();
+		String meta_data = "fix_with_ai:" + p_message.text;
+		log->push_meta(meta_data);
+		log->add_text("[Fix with AI]");
+		log->pop(); // meta
+		log->pop(); // underline
+		log->pop(); // color
+	}
+
 	if (p_message.clear || p_message.type != MSG_TYPE_STD_RICH) {
 		log->pop_all(); // Pop all unclosed tags.
 	}

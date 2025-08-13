@@ -1636,7 +1636,6 @@ void CodeTextEditor::_update_font_ligatures() {
 }
 
 void CodeTextEditor::_text_changed_idle_timeout() {
-	_validate_script();
 	emit_signal(SNAME("validate_script"));
 }
 

@@ -287,7 +287,7 @@ void FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory 
 		const String main_scene = ResourceUID::ensure_path(GLOBAL_GET("application/run/main_scene"));
 
 		// Build the list of the files to display.
-		List<FileInfo> file_list;
+		List<EditorFileInfo> file_list;
 		for (int i = 0; i < p_dir->get_file_count(); i++) {
 			String file_type = p_dir->get_file_type(i);
 			if (_is_file_type_disabled_by_feature_profile(file_type)) {
@@ -295,7 +295,7 @@ void FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory 
 				continue;
 			}
 
-			FileInfo file_info;
+			EditorFileInfo file_info;
 			file_info.name = p_dir->get_file(i);
 			file_info.type = p_dir->get_file_type(i);
 			file_info.icon_path = p_dir->get_file_icon_path(i);
@@ -311,7 +311,7 @@ void FileSystemDock::_create_tree(TreeItem *p_parent, EditorFileSystemDirectory 
 		// Build the tree.
 		const int icon_size = get_theme_constant(SNAME("class_icon_size"), EditorStringName(Editor));
 
-		for (const FileInfo &file_info : file_list) {
+		for (const EditorFileInfo &file_info : file_list) {
 			TreeItem *file_item = tree->create_item(subdirectory_item);
 			const String file_metadata = lpath.path_join(file_info.name);
 			file_item->set_text(0, file_info.name);
@@ -893,7 +893,7 @@ bool FileSystemDock::_is_file_type_disabled_by_feature_profile(const StringName 
 	return false;
 }
 
-void FileSystemDock::_search(EditorFileSystemDirectory *p_path, List<FileInfo> *matches, int p_max_items) {
+void FileSystemDock::_search(EditorFileSystemDirectory *p_path, List<EditorFileInfo> *matches, int p_max_items) {
 	if (matches->size() > p_max_items) {
 		return;
 	}
@@ -906,7 +906,7 @@ void FileSystemDock::_search(EditorFileSystemDirectory *p_path, List<FileInfo> *
 		String file = p_path->get_file(i);
 
 		if (_matches_all_search_tokens(file)) {
-			FileInfo file_info;
+			EditorFileInfo file_info;
 			file_info.name = file;
 			file_info.type = p_path->get_file_type(i);
 			file_info.path = p_path->get_file_path(i);
@@ -986,7 +986,7 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 	const Color default_folder_color = get_theme_color(SNAME("folder_icon_color"), SNAME("FileDialog"));
 
 	// Build the FileInfo list.
-	List<FileInfo> file_list;
+	List<EditorFileInfo> file_list;
 	if (current_path == "Favorites") {
 		// Display the favorites.
 		Vector<String> favorites_list = EditorSettings::get_singleton()->get_favorites();
@@ -1011,7 +1011,7 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 				int index;
 				EditorFileSystemDirectory *efd = EditorFileSystem::get_singleton()->find_file(favorite, &index);
 
-				FileInfo file_info;
+				EditorFileInfo file_info;
 				file_info.name = favorite.get_file();
 				file_info.path = favorite;
 				if (efd) {
@@ -1105,7 +1105,7 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 
 			// Display the folder content.
 			for (int i = 0; i < efd->get_file_count(); i++) {
-				FileInfo file_info;
+				EditorFileInfo file_info;
 				file_info.name = efd->get_file(i);
 				file_info.path = directory.path_join(file_info.name);
 				file_info.type = efd->get_file_type(i);
@@ -1123,8 +1123,8 @@ void FileSystemDock::_update_file_list(bool p_keep_selection) {
 
 	// Fills the ItemList control node from the FileInfos.
 	const String main_scene = ResourceUID::ensure_path(GLOBAL_GET("application/run/main_scene"));
-	for (FileInfo &E : file_list) {
-		FileInfo *finfo = &(E);
+	for (EditorFileInfo &E : file_list) {
+		EditorFileInfo *finfo = &(E);
 		String fname = finfo->name;
 		String fpath = finfo->path;
 

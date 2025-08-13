@@ -50,6 +50,11 @@
 #include "scene/gui/rich_text_label.h"
 #include "scene/gui/slider.h"
 #include "scene/gui/split_container.h"
+#include "editor/gui/editor_file_dialog.h"
+#include "scene/resources/style_box_flat.h"
+
+// dtl diff library
+#include "dtl.hpp"
 
 void ConnectionInfoDialog::ok_pressed() {
 }
@@ -143,9 +148,18 @@ void ScriptTextEditor::apply_code() {
 	if (script.is_null()) {
 		return;
 	}
+    // If a diff preview is active, treat save as accepting the diff.
+    if (has_pending_diffs) {
+        CodeEdit *te_local = code_editor->get_text_editor();
+        te_local->set_editable(true);
+    }
 	script->set_source_code(code_editor->get_text_editor()->get_text());
 	script->update_exports();
 	code_editor->get_text_editor()->get_syntax_highlighter()->update_cache();
+    if (has_pending_diffs) {
+        // Saving should exit diff mode so the editor returns to normal state.
+        _clear_diff_data();
+    }
 }
 
 Ref<Resource> ScriptTextEditor::get_edited_resource() const {
@@ -157,6 +171,9 @@ void ScriptTextEditor::set_edited_resource(const Ref<Resource> &p_res) {
 	ERR_FAIL_COND(p_res.is_null());
 
 	script = p_res;
+
+    // Reset any previous inline diff state when switching the edited resource
+    _clear_diff_data();
 
 	code_editor->get_text_editor()->set_text(script->get_source_code());
 	code_editor->get_text_editor()->clear_undo_history();
@@ -188,45 +205,14 @@ void ScriptTextEditor::enable_editor(Control *p_shortcut_context) {
 }
 
 void ScriptTextEditor::_load_theme_settings() {
-	CodeEdit *text_edit = code_editor->get_text_editor();
+	code_editor->update_editor_settings();
 
-	Color updated_warning_line_color = EDITOR_GET("text_editor/theme/highlighting/warning_color");
-	Color updated_marked_line_color = EDITOR_GET("text_editor/theme/highlighting/mark_color");
-	Color updated_safe_line_number_color = EDITOR_GET("text_editor/theme/highlighting/safe_line_number_color");
-	Color updated_folded_code_region_color = EDITOR_GET("text_editor/theme/highlighting/folded_code_region_color");
-
-	bool warning_line_color_updated = updated_warning_line_color != warning_line_color;
-	bool marked_line_color_updated = updated_marked_line_color != marked_line_color;
-	bool safe_line_number_color_updated = updated_safe_line_number_color != safe_line_number_color;
-	bool folded_code_region_color_updated = updated_folded_code_region_color != folded_code_region_color;
-	if (safe_line_number_color_updated || warning_line_color_updated || marked_line_color_updated || folded_code_region_color_updated) {
-		safe_line_number_color = updated_safe_line_number_color;
-		for (int i = 0; i < text_edit->get_line_count(); i++) {
-			if (warning_line_color_updated && text_edit->get_line_background_color(i) == warning_line_color) {
-				text_edit->set_line_background_color(i, updated_warning_line_color);
-			}
-
-			if (marked_line_color_updated && text_edit->get_line_background_color(i) == marked_line_color) {
-				text_edit->set_line_background_color(i, updated_marked_line_color);
-			}
-
-			if (safe_line_number_color_updated && text_edit->get_line_gutter_item_color(i, line_number_gutter) != default_line_number_color) {
-				text_edit->set_line_gutter_item_color(i, line_number_gutter, safe_line_number_color);
-			}
-
-			if (folded_code_region_color_updated && text_edit->get_line_background_color(i) == folded_code_region_color) {
-				text_edit->set_line_background_color(i, updated_folded_code_region_color);
-			}
-		}
-		warning_line_color = updated_warning_line_color;
-		marked_line_color = updated_marked_line_color;
-		folded_code_region_color = updated_folded_code_region_color;
-	}
-
-	theme_loaded = true;
-	if (script.is_valid()) {
-		_set_theme_for_script();
-	}
+	// Colors
+	default_line_number_color = get_theme_color(SNAME("line_number_color"), EditorStringName(Editor));
+	safe_line_number_color = get_theme_color(SNAME("safe_line_number_color"), EditorStringName(Editor));
+	folded_code_region_color = code_editor->get_theme_color(SNAME("folded_code_region_color"), SNAME("CodeEdit"));
+	marked_line_color = EDITOR_GET("text_editor/theme/highlighting/mark_color");
+	warning_line_color = code_editor->get_theme_color(SNAME("warning_line_color"), SNAME("CodeEdit"));
 }
 
 void ScriptTextEditor::_set_theme_for_script() {
@@ -279,7 +265,9 @@ void ScriptTextEditor::_show_errors_panel(bool p_show) {
 }
 
 void ScriptTextEditor::_show_warnings_panel(bool p_show) {
-	warnings_panel->set_visible(p_show);
+	if (p_show) {
+		warnings_panel->set_visible(p_show);
+	}
 }
 
 void ScriptTextEditor::_warning_clicked(const Variant &p_line) {
@@ -625,43 +613,7 @@ void ScriptTextEditor::_update_color_constructor_options() {
 	}
 }
 
-void ScriptTextEditor::_update_background_color() {
-	// Clear background lines.
-	CodeEdit *te = code_editor->get_text_editor();
-	for (int i = 0; i < te->get_line_count(); i++) {
-		bool is_folded_code_region = te->is_line_code_region_start(i) && te->is_line_folded(i);
-		te->set_line_background_color(i, is_folded_code_region ? folded_code_region_color : Color(0, 0, 0, 0));
-	}
 
-	// Set the warning background.
-	if (warning_line_color.a != 0.0) {
-		for (const ScriptLanguage::Warning &warning : warnings) {
-			int warning_start_line = CLAMP(warning.start_line - 1, 0, te->get_line_count() - 1);
-			int warning_end_line = CLAMP(warning.end_line - 1, 0, te->get_line_count() - 1);
-			int folded_line_header = te->get_folded_line_header(warning_start_line);
-
-			// If the warning highlight is too long, only highlight the start line.
-			const int warning_max_lines = 20;
-
-			te->set_line_background_color(folded_line_header, warning_line_color);
-			if (warning_end_line - warning_start_line < warning_max_lines) {
-				for (int i = warning_start_line + 1; i <= warning_end_line; i++) {
-					te->set_line_background_color(i, warning_line_color);
-				}
-			}
-		}
-	}
-
-	// Set the error background.
-	if (marked_line_color.a != 0.0) {
-		for (const ScriptLanguage::ScriptError &error : errors) {
-			int error_line = CLAMP(error.line - 1, 0, te->get_line_count() - 1);
-			int folded_line_header = te->get_folded_line_header(error_line);
-
-			te->set_line_background_color(folded_line_header, marked_line_color);
-		}
-	}
-}
 
 void ScriptTextEditor::_update_color_text() {
 	if (inline_color_line < 0) {
@@ -726,7 +678,7 @@ Variant ScriptTextEditor::get_previous_state() {
 }
 
 void ScriptTextEditor::store_previous_state() {
-	return code_editor->store_previous_state();
+	code_editor->store_previous_state();
 }
 
 void ScriptTextEditor::_convert_case(CodeTextEditor::CaseStyle p_case) {
@@ -752,6 +704,10 @@ void ScriptTextEditor::convert_indent() {
 void ScriptTextEditor::tag_saved_version() {
 	code_editor->get_text_editor()->tag_saved_version();
 	edited_file_data.last_modified_time = FileAccess::get_modified_time(edited_file_data.path);
+    // Ensure no lingering diff after explicit save operations
+    if (has_pending_diffs) {
+        _clear_diff_data();
+    }
 }
 
 void ScriptTextEditor::goto_line(int p_line, int p_column) {
@@ -866,7 +822,7 @@ void ScriptTextEditor::_validate_script() {
 	_update_connected_methods();
 	_update_warnings();
 	_update_errors();
-	_update_background_color();
+	
 
 	emit_signal(SNAME("name_changed"));
 	emit_signal(SNAME("edited_script_changed"));
@@ -876,146 +832,86 @@ void ScriptTextEditor::_update_warnings() {
 	int warning_nb = warnings.size();
 	warnings_panel->clear();
 
-	bool has_connections_table = false;
-	// Add missing connections.
-	if (GLOBAL_GET("debug/gdscript/warnings/enable")) {
-		Node *base = get_tree()->get_edited_scene_root();
-		if (base && missing_connections.size() > 0) {
-			has_connections_table = true;
-			warnings_panel->push_table(1);
-			for (const Connection &connection : missing_connections) {
-				String base_path = base->get_name();
-				String source_path = base == connection.signal.get_object() ? base_path : base_path + "/" + String(base->get_path_to(Object::cast_to<Node>(connection.signal.get_object())));
-				String target_path = base == connection.callable.get_object() ? base_path : base_path + "/" + String(base->get_path_to(Object::cast_to<Node>(connection.callable.get_object())));
-
-				warnings_panel->push_cell();
-				warnings_panel->push_color(warnings_panel->get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
-				warnings_panel->add_text(vformat(TTR("Missing connected method '%s' for signal '%s' from node '%s' to node '%s'."), connection.callable.get_method(), connection.signal.get_name(), source_path, target_path));
-				warnings_panel->pop(); // Color.
-				warnings_panel->pop(); // Cell.
+	// Clear background lines that were previously warnings but don't have errors.
+	CodeEdit *te = code_editor->get_text_editor();
+	for (int line : warning_lines) {
+		// Only clear if this line doesn't have an error
+		bool has_error = false;
+		for (const ScriptLanguage::ScriptError &error : errors) {
+			if (error.line - 1 == line) {
+				has_error = true;
+				break;
 			}
-			warnings_panel->pop(); // Table.
-
-			warning_nb += missing_connections.size();
 		}
+		if (!has_error) {
+			bool is_folded_code_region = te->is_line_code_region_start(line) && te->is_line_folded(line);
+			te->set_line_background_color(line, is_folded_code_region ? folded_code_region_color : Color(0, 0, 0, 0));
+		}
+	}
+	warning_lines.clear();
+
+	// Set the warning background.
+	if (warning_line_color.a != 0.0) {
+		for (const ScriptLanguage::Warning &warning : warnings) {
+			int warning_start_line = CLAMP(warning.start_line - 1, 0, te->get_line_count() - 1);
+			int warning_end_line = CLAMP(warning.end_line - 1, 0, te->get_line_count() - 1);
+			int folded_line_header = te->get_folded_line_header(warning_start_line);
+
+			// If the warning highlight is too long, only highlight the start line.
+			const int warning_max_lines = 20;
+
+			te->set_line_background_color(folded_line_header, warning_line_color);
+			warning_lines.insert(folded_line_header);
+			if (warning_end_line - warning_start_line < warning_max_lines) {
+				for (int i = warning_start_line + 1; i <= warning_end_line; i++) {
+					te->set_line_background_color(i, warning_line_color);
+					warning_lines.insert(i);
+				}
+			}
+		}
+	}
+
+	bool has_connections_table = false;
+	for (const Connection &connection : missing_connections) {
+		if (!has_connections_table) {
+			has_connections_table = true;
+		}
+
+		warnings_panel->push_cell();
+		warnings_panel->push_color(warning_line_color);
+		warnings_panel->add_text(TTR("Warning:"));
+		warnings_panel->pop();
+		warnings_panel->add_text(" ");
+		warnings_panel->push_meta(connection.callable.get_method());
+		warnings_panel->add_text(vformat(TTR("Invalid connection to signal: '%s'."), connection.signal.get_name()));
+		warnings_panel->pop();
+		warnings_panel->pop();
+
+		warnings_panel->push_cell();
+		warnings_panel->pop();
+
+		warning_nb += missing_connections.size();
 	}
 
 	code_editor->set_warning_count(warning_nb);
-
-	if (has_connections_table) {
-		warnings_panel->add_newline();
-	}
-
-	// Add script warnings.
-	warnings_panel->push_table(3);
-	for (const ScriptLanguage::Warning &w : warnings) {
-		Dictionary ignore_meta;
-		ignore_meta["line"] = w.start_line;
-		ignore_meta["code"] = w.string_code.to_lower();
-		warnings_panel->push_cell();
-		warnings_panel->push_meta(ignore_meta);
-		warnings_panel->push_color(
-				warnings_panel->get_theme_color(SNAME("accent_color"), EditorStringName(Editor)).lerp(warnings_panel->get_theme_color(SNAME("mono_color"), EditorStringName(Editor)), 0.5f));
-		warnings_panel->add_text(TTR("[Ignore]"));
-		warnings_panel->pop(); // Color.
-		warnings_panel->pop(); // Meta ignore.
-		warnings_panel->pop(); // Cell.
-
-		warnings_panel->push_cell();
-		warnings_panel->push_meta(w.start_line - 1);
-		warnings_panel->push_color(warnings_panel->get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
-		warnings_panel->add_text(vformat(TTR("Line %d (%s):"), w.start_line, w.string_code));
-		warnings_panel->pop(); // Color.
-		warnings_panel->pop(); // Meta goto.
-		warnings_panel->pop(); // Cell.
-
-		warnings_panel->push_cell();
-		warnings_panel->add_text(w.message);
-		warnings_panel->add_newline();
-		warnings_panel->pop(); // Cell.
-	}
-	warnings_panel->pop(); // Table.
 }
 
 void ScriptTextEditor::_update_errors() {
-	code_editor->set_error_count(errors.size());
-
+	code_editor->get_text_editor()->clear_breakpointed_lines();
 	errors_panel->clear();
-	errors_panel->push_table(2);
-	for (const ScriptLanguage::ScriptError &err : errors) {
-		Dictionary click_meta;
-		click_meta["line"] = err.line;
-		click_meta["column"] = err.column;
 
-		errors_panel->push_cell();
-		errors_panel->push_meta(err.line - 1);
-		errors_panel->push_color(warnings_panel->get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-		errors_panel->add_text(vformat(TTR("Line %d:"), err.line));
-		errors_panel->pop(); // Color.
-		errors_panel->pop(); // Meta goto.
-		errors_panel->pop(); // Cell.
-
-		errors_panel->push_cell();
-		errors_panel->add_text(err.message);
-		errors_panel->add_newline();
-		errors_panel->pop(); // Cell.
-	}
-	errors_panel->pop(); // Table
-
-	for (const KeyValue<String, List<ScriptLanguage::ScriptError>> &KV : depended_errors) {
-		Dictionary click_meta;
-		click_meta["path"] = KV.key;
-		click_meta["line"] = 1;
-
-		errors_panel->add_newline();
-		errors_panel->add_newline();
-		errors_panel->push_meta(click_meta);
-		errors_panel->add_text(vformat(R"(%s:)", KV.key));
-		errors_panel->pop(); // Meta goto.
-		errors_panel->add_newline();
-
-		errors_panel->push_indent(1);
-		errors_panel->push_table(2);
-		String filename = KV.key.get_file();
-		for (const ScriptLanguage::ScriptError &err : KV.value) {
-			click_meta["line"] = err.line;
-			click_meta["column"] = err.column;
-
-			errors_panel->push_cell();
-			errors_panel->push_meta(click_meta);
-			errors_panel->push_color(errors_panel->get_theme_color(SNAME("error_color"), EditorStringName(Editor)));
-			errors_panel->add_text(vformat(TTR("Line %d:"), err.line));
-			errors_panel->pop(); // Color.
-			errors_panel->pop(); // Meta goto.
-			errors_panel->pop(); // Cell.
-
-			errors_panel->push_cell();
-			errors_panel->add_text(err.message);
-			errors_panel->pop(); // Cell.
-		}
-		errors_panel->pop(); // Table
-		errors_panel->pop(); // Indent.
-	}
-
-	bool highlight_safe = EDITOR_GET("text_editor/appearance/gutters/highlight_type_safe_lines");
-	bool last_is_safe = false;
+	// Set the error background.
 	CodeEdit *te = code_editor->get_text_editor();
+	if (marked_line_color.a != 0.0) {
+		for (const ScriptLanguage::ScriptError &error : errors) {
+			int error_line = CLAMP(error.line - 1, 0, te->get_line_count() - 1);
+			int folded_line_header = te->get_folded_line_header(error_line);
 
-	for (int i = 0; i < te->get_line_count(); i++) {
-		if (highlight_safe) {
-			if (safe_lines.has(i + 1)) {
-				te->set_line_gutter_item_color(i, line_number_gutter, safe_line_number_color);
-				last_is_safe = true;
-			} else if (last_is_safe && (te->is_in_comment(i) != -1 || te->get_line(i).strip_edges().is_empty())) {
-				te->set_line_gutter_item_color(i, line_number_gutter, safe_line_number_color);
-			} else {
-				te->set_line_gutter_item_color(i, line_number_gutter, default_line_number_color);
-				last_is_safe = false;
-			}
-		} else {
-			te->set_line_gutter_item_color(i, 1, default_line_number_color);
+			te->set_line_background_color(folded_line_header, marked_line_color);
 		}
 	}
+
+	code_editor->set_error_count(errors.size() + depended_errors.size());
 }
 
 void ScriptTextEditor::_update_bookmark_list() {
@@ -1666,49 +1562,56 @@ void ScriptTextEditor::_update_gutter_indexes() {
 			line_number_gutter = i;
 			continue;
 		}
+
+		if (code_editor->get_text_editor()->get_gutter_name(i) == "diff_gutter") {
+			diff_gutter = i;
+			continue;
+		}
 	}
 }
 
 void ScriptTextEditor::_gutter_clicked(int p_line, int p_gutter) {
-	if (p_gutter != connection_gutter) {
-		return;
-	}
-
-	Dictionary meta = code_editor->get_text_editor()->get_line_gutter_metadata(p_line, p_gutter);
-	String type = meta.get("type", "");
-	if (type.is_empty()) {
-		return;
-	}
-
-	// All types currently need a method name.
-	String method = meta.get("method", "");
-	if (method.is_empty()) {
-		return;
-	}
-
-	if (type == "connection") {
-		Node *base = get_tree()->get_edited_scene_root();
-		if (!base) {
+	if (p_gutter == connection_gutter) {
+		Dictionary meta = code_editor->get_text_editor()->get_line_gutter_metadata(p_line, p_gutter);
+		String type = meta.get("type", "");
+		if (type.is_empty()) {
 			return;
 		}
 
-		Vector<Node *> nodes = _find_all_node_for_script(base, base, script);
-		connection_info_dialog->popup_connections(method, nodes);
-	} else if (type == "inherits") {
-		String base_class_raw = meta["base_class"];
-		PackedStringArray base_class_split = base_class_raw.split(":", true, 1);
-
-		if (base_class_split[0] == "script") {
-			// Go to function declaration.
-			Ref<Script> base_script = ResourceLoader::load(base_class_split[1]);
-			ERR_FAIL_COND(base_script.is_null());
-			emit_signal(SNAME("go_to_method"), base_script, method);
-		} else if (base_class_split[0] == "builtin") {
-			// Open method documentation.
-			emit_signal(SNAME("go_to_help"), "class_method:" + base_class_split[1] + ":" + method);
+		// All types currently need a method name.
+		String method = meta.get("method", "");
+		if (method.is_empty()) {
+			return;
 		}
+
+		if (type == "connection") {
+			Node *base = get_tree()->get_edited_scene_root();
+			if (!base) {
+				return;
+			}
+
+			Vector<Node *> nodes = _find_all_node_for_script(base, base, script);
+			connection_info_dialog->popup_connections(method, nodes);
+		} else if (type == "inherits") {
+			String base_class_raw = meta["base_class"];
+			PackedStringArray base_class_split = base_class_raw.split(":", true, 1);
+
+			if (base_class_split[0] == "script") {
+				// Go to function declaration.
+				Ref<Script> base_script = ResourceLoader::load(base_class_split[1]);
+				ERR_FAIL_COND(base_script.is_null());
+				emit_signal(SNAME("go_to_method"), base_script, method);
+			} else if (base_class_split[0] == "builtin") {
+				// Open method documentation.
+				emit_signal(SNAME("go_to_help"), "class_method:" + base_class_split[1] + ":" + method);
+			}
+		}
+	} else if (p_gutter == diff_gutter) {
+		// Diff gutter clicks are now handled only by toolbar buttons
 	}
 }
+
+
 
 void ScriptTextEditor::_edit_option(int p_op) {
 	CodeEdit *tx = code_editor->get_text_editor();
@@ -2067,28 +1970,8 @@ void ScriptTextEditor::_change_syntax_highlighter(int p_idx) {
 
 void ScriptTextEditor::_notification(int p_what) {
 	switch (p_what) {
-		case NOTIFICATION_TRANSLATION_CHANGED: {
-			if (is_ready() && is_visible_in_tree()) {
-				_update_errors();
-				_update_warnings();
-			}
-		} break;
-
-		case NOTIFICATION_THEME_CHANGED:
-			if (!editor_enabled) {
-				break;
-			}
-			if (is_visible_in_tree()) {
-				_update_warnings();
-				_update_errors();
-				_update_background_color();
-			}
-			[[fallthrough]];
-		case NOTIFICATION_ENTER_TREE: {
-			code_editor->get_text_editor()->set_gutter_width(connection_gutter, code_editor->get_text_editor()->get_line_height());
-			Ref<Font> code_font = get_theme_font("font", "CodeEdit");
-			inline_color_options->add_theme_font_override("font", code_font);
-			inline_color_options->get_popup()->add_theme_font_override("font", code_font);
+		case NOTIFICATION_THEME_CHANGED: {
+			_load_theme_settings();
 		} break;
 	}
 }
@@ -2671,7 +2554,7 @@ void ScriptTextEditor::_enable_code_editor() {
 	code_editor->get_text_editor()->connect("gutter_added", callable_mp(this, &ScriptTextEditor::_update_gutter_indexes));
 	code_editor->get_text_editor()->connect("gutter_removed", callable_mp(this, &ScriptTextEditor::_update_gutter_indexes));
 	code_editor->get_text_editor()->connect("gutter_clicked", callable_mp(this, &ScriptTextEditor::_gutter_clicked));
-	code_editor->get_text_editor()->connect("_fold_line_updated", callable_mp(this, &ScriptTextEditor::_update_background_color));
+
 	code_editor->get_text_editor()->connect(SceneStringName(gui_input), callable_mp(this, &ScriptTextEditor::_text_edit_gui_input));
 	code_editor->show_toggle_files_button();
 	_update_gutter_indexes();
@@ -2825,6 +2708,16 @@ ScriptTextEditor::ScriptTextEditor() {
 	code_editor->get_text_editor()->set_gutter_draw(connection_gutter, false);
 	code_editor->get_text_editor()->set_gutter_overwritable(connection_gutter, true);
 	code_editor->get_text_editor()->set_gutter_type(connection_gutter, TextEdit::GUTTER_TYPE_ICON);
+
+	// Add diff gutter
+	diff_gutter = code_editor->get_text_editor()->get_gutter_count();
+	code_editor->get_text_editor()->add_gutter(diff_gutter);
+	code_editor->get_text_editor()->set_gutter_name(diff_gutter, "diff_gutter");
+	code_editor->get_text_editor()->set_gutter_draw(diff_gutter, false);
+	code_editor->get_text_editor()->set_gutter_overwritable(diff_gutter, true);
+	code_editor->get_text_editor()->set_gutter_type(diff_gutter, TextEdit::GUTTER_TYPE_STRING);
+	code_editor->get_text_editor()->set_gutter_clickable(diff_gutter, true);
+	code_editor->get_text_editor()->set_gutter_width(diff_gutter, 16);
 
 	warnings_panel = memnew(RichTextLabel);
 	warnings_panel->set_custom_minimum_size(Size2(0, 100 * EDSCALE));
@@ -2983,7 +2876,7 @@ void ScriptTextEditor::register_editor() {
 	ED_SHORTCUT("script_text_editor/goto_next_bookmark", TTRC("Go to Next Bookmark"), KeyModifierMask::CMD_OR_CTRL | Key::B);
 	ED_SHORTCUT_OVERRIDE("script_text_editor/goto_next_bookmark", "macos", KeyModifierMask::CMD_OR_CTRL | KeyModifierMask::SHIFT | KeyModifierMask::ALT | Key::B);
 
-	ED_SHORTCUT("script_text_editor/goto_previous_bookmark", TTRC("Go to Previous Bookmark"), KeyModifierMask::CMD_OR_CTRL | KeyModifierMask::SHIFT | Key::B);
+	ED_SHORTCUT("script_text_editor/goto_previous_bookmark", TTRC("Go to Previous Bookmark"), KeyModifierMask::CMD_OR_CTRL | Key::SHIFT | Key::B);
 	ED_SHORTCUT("script_text_editor/remove_all_bookmarks", TTRC("Remove All Bookmarks"), Key::NONE);
 
 	ED_SHORTCUT("script_text_editor/goto_function", TTRC("Go to Function..."), KeyModifierMask::ALT | KeyModifierMask::CTRL | Key::F);
@@ -3006,3 +2899,331 @@ void ScriptTextEditor::register_editor() {
 void ScriptTextEditor::validate() {
 	code_editor->validate_script();
 }
+
+// Simple Myers O(ND) Diff Algorithm Implementation
+class MyersDiff {
+private:
+	Vector<String> original_lines;
+	Vector<String> modified_lines;
+	
+	struct Point {
+		int x, y;
+		Point(int x = 0, int y = 0) : x(x), y(y) {}
+		Point operator+(const Point& other) const { return Point(x + other.x, y + other.y); }
+	};
+	
+	Vector<MyersDiffEdit> compute_diff() {
+		int N = original_lines.size();
+		int M = modified_lines.size();
+		
+		// Handle edge cases
+		if (N == 0 && M == 0) {
+			return Vector<MyersDiffEdit>();
+		}
+		
+		if (N == 0) {
+			// All insertions
+			Vector<MyersDiffEdit> result_diff;
+			for (int i = 0; i < M; i++) {
+				MyersDiffEdit edit;
+				edit.type = MyersDiffEdit::INSERT;
+				edit.text = modified_lines[i];
+				edit.original_line = 0;
+				edit.modified_line = i;
+				result_diff.push_back(edit);
+			}
+			return result_diff;
+		}
+		
+		if (M == 0) {
+			// All deletions
+			Vector<MyersDiffEdit> result_diff;
+			for (int i = 0; i < N; i++) {
+				MyersDiffEdit edit;
+				edit.type = MyersDiffEdit::DELETE;
+				edit.text = original_lines[i];
+				edit.original_line = i;
+				edit.modified_line = 0;
+				result_diff.push_back(edit);
+			}
+			return result_diff;
+		}
+		
+		int max_d = N + M;
+		
+		// V array for the algorithm
+		Vector<int> V;
+		V.resize(2 * max_d + 1);
+		for (int i = 0; i < V.size(); i++) {
+			V.write[i] = -1;
+		}
+		V.write[max_d + 1] = 0;
+		
+		// Find the shortest edit script
+		Vector<Vector<int>> trace;
+		
+		for (int d = 0; d <= max_d; d++) {
+			Vector<int> v_copy = V;
+			trace.push_back(v_copy);
+			
+			for (int k = -d; k <= d; k += 2) {
+				int x;
+				if (k == -d || (k != d && V[max_d + k - 1] < V[max_d + k + 1])) {
+					x = V[max_d + k + 1];
+				} else {
+					x = V[max_d + k - 1] + 1;
+				}
+				
+				int y = x - k;
+				
+				while (x < N && y < M && original_lines[x] == modified_lines[y]) {
+					x++;
+					y++;
+				}
+				
+				V.write[max_d + k] = x;
+				
+				if (x >= N && y >= M) {
+					// Found the solution, now backtrack
+					Vector<MyersDiffEdit> result_diff;
+					
+					x = N;
+					y = M;
+					
+					for (int trace_d = d; trace_d >= 0; trace_d--) {
+						const Vector<int> &v = trace[trace_d];
+						int k = x - y;
+						
+						int prev_k;
+						if (k == -trace_d || (k != trace_d && v[max_d + k - 1] < v[max_d + k + 1])) {
+							prev_k = k + 1;
+						} else {
+							prev_k = k - 1;
+						}
+						
+						int prev_x = (trace_d > 0) ? v[max_d + prev_k] : 0;
+						int prev_y = prev_x - prev_k;
+						
+						while (x > prev_x && y > prev_y) {
+							x--;
+							y--;
+						}
+						
+						if (trace_d > 0) {
+							if (x > prev_x) {
+								MyersDiffEdit edit;
+								edit.type = MyersDiffEdit::DELETE;
+								edit.text = original_lines[x - 1];
+								edit.original_line = x - 1;
+								edit.modified_line = y;
+								result_diff.push_back(edit);
+								x = prev_x;
+							} else if (y > prev_y) {
+								MyersDiffEdit edit;
+								edit.type = MyersDiffEdit::INSERT;
+								edit.text = modified_lines[y - 1];
+								edit.original_line = x;
+								edit.modified_line = y;
+								result_diff.push_back(edit);
+								y = prev_y;
+							}
+						}
+					}
+					
+					// Reverse the diff since we built it backwards
+					result_diff.reverse();
+					return result_diff;
+				}
+			}
+		}
+		
+		// Fallback - should not happen
+		return Vector<MyersDiffEdit>();
+	}
+	
+public:
+	Vector<MyersDiffEdit> diff(const Vector<String>& orig, const Vector<String>& mod) {
+		original_lines = orig;
+		modified_lines = mod;
+		return compute_diff();
+	}
+};
+
+// Simple unified diff viewer - no live editing, just static comparison
+void ScriptTextEditor::set_diff(const String &p_original_content, const String &p_modified_content) {
+	_clear_diff_data();
+    // Normalize line endings to avoid false positives where entire file appears changed.
+    original_content = p_original_content.replace("\r\n", "\n");
+    modified_content = p_modified_content.replace("\r\n", "\n");
+
+	if (original_content == modified_content) {
+		return;
+	}
+
+    _show_unified_diff(original_content, modified_content);
+    _show_diff_toolbar();
+	has_pending_diffs = true;
+}
+
+void ScriptTextEditor::_show_unified_diff(const String &p_original, const String &p_modified) {
+    // Show the complete modified file with change indicators
+    Vector<String> original_lines = p_original.split("\n");
+    Vector<String> modified_lines = p_modified.split("\n");
+
+    CodeEdit *te = code_editor->get_text_editor();
+    // Set content once
+    te->set_text(modified_content);
+    // Read-only during preview
+    te->set_editable(false);
+
+    // Clear any previous background colors
+    for (int i = 0; i < te->get_line_count(); i++) {
+        te->set_line_background_color(i, Color(0, 0, 0, 0));
+    }
+
+    // Compute highlights: changed lines (within overlap) and added lines (beyond original)
+    const int overlap = MIN(original_lines.size(), modified_lines.size());
+    Vector<int> changed_lines;
+    Vector<int> added_lines;
+
+    for (int i = 0; i < overlap; i++) {
+        if (original_lines[i] != modified_lines[i]) {
+            changed_lines.push_back(i);
+        }
+    }
+    for (int i = overlap; i < modified_lines.size(); i++) {
+        added_lines.push_back(i);
+    }
+
+    // Colors
+    const Color changed_color = Color(0.2, 0.6, 1.0, 0.25); // Blue-ish for modified lines
+    const Color added_color = Color(0.1, 0.8, 0.1, 0.30);   // Green for new lines
+
+    for (int line_num : changed_lines) {
+        if (line_num < te->get_line_count()) {
+            te->set_line_background_color(line_num, changed_color);
+        }
+    }
+    for (int line_num : added_lines) {
+        if (line_num < te->get_line_count()) {
+            te->set_line_background_color(line_num, added_color);
+        }
+    }
+}
+
+void ScriptTextEditor::_apply_all_diff_hunks(bool p_accept) {
+	CodeEdit *te = code_editor->get_text_editor();
+	
+	// Re-enable editing
+	te->set_editable(true);
+	
+	if (p_accept) {
+		// Apply the modified content (without the header comments)
+		te->set_text(modified_content);
+        // Persist to disk immediately so the editor reflects accepted changes
+        apply_code();
+    } else {
+		// Revert to the original content
+		te->set_text(original_content);
+        // Save the revert so on re-open it matches the old version
+        apply_code();
+	}
+    // Mark the current buffer as up to date and reset undo history
+    te->clear_undo_history();
+    te->tag_saved_version();
+
+    // Ensure we fully reset diff state and highlights so later file opens are clean
+    _clear_diff_data();
+}
+
+void ScriptTextEditor::_clear_diff_data() {
+	original_content = "";
+	modified_content = "";
+	has_pending_diffs = false;
+
+	CodeEdit *te = code_editor->get_text_editor();
+	if (te) {
+		// Re-enable editing and clear background colors
+		te->set_editable(true);
+		for (int i = 0; i < te->get_line_count(); i++) {
+			te->set_line_background_color(i, Color(0, 0, 0, 0));
+		}
+	}
+	_hide_diff_toolbar();
+}
+
+void ScriptTextEditor::_create_diff_toolbar() {
+	if (diff_toolbar) {
+		return;
+	}
+
+	PanelContainer *toolbar_panel = memnew(PanelContainer);
+	toolbar_panel->add_theme_style_override("panel", EditorNode::get_singleton()->get_gui_base()->get_theme_stylebox("panel", "EditorProperty"));
+
+	HBoxContainer *toolbar_hbox = memnew(HBoxContainer);
+	toolbar_hbox->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	toolbar_hbox->set_custom_minimum_size(Size2(0, 32));
+	toolbar_hbox->add_spacer();
+
+	Label *label = memnew(Label);
+	label->set_text("AI Code Changes Preview (Read-Only):");
+	label->add_theme_color_override("font_color", Color(0.8, 0.8, 0.8));
+	toolbar_hbox->add_child(label);
+
+	toolbar_hbox->add_spacer();
+
+	accept_all_button = memnew(Button);
+	accept_all_button->set_text("Accept All");
+	accept_all_button->add_theme_color_override("font_color", Color(0.2, 0.8, 0.2));
+	accept_all_button->connect("pressed", callable_mp(this, &ScriptTextEditor::_on_accept_all_pressed));
+	toolbar_hbox->add_child(accept_all_button);
+
+	reject_all_button = memnew(Button);
+	reject_all_button->set_text("Reject All");
+	reject_all_button->add_theme_color_override("font_color", Color(0.8, 0.2, 0.2));
+	reject_all_button->connect("pressed", callable_mp(this, &ScriptTextEditor::_on_reject_all_pressed));
+	toolbar_hbox->add_child(reject_all_button);
+
+	toolbar_hbox->add_spacer();
+	toolbar_panel->add_child(toolbar_hbox);
+
+	VSplitContainer *editor_box = nullptr;
+	for (int i = 0; i < get_child_count(); i++) {
+		editor_box = Object::cast_to<VSplitContainer>(get_child(i));
+		if (editor_box) {
+			break;
+		}
+	}
+
+	if (editor_box) {
+		editor_box->add_child(toolbar_panel);
+		editor_box->move_child(toolbar_panel, editor_box->get_child_count() - 1);
+	} else {
+		add_child(toolbar_panel);
+	}
+
+	toolbar_panel->set_visible(false);
+	diff_toolbar = toolbar_panel;
+}
+
+void ScriptTextEditor::_show_diff_toolbar() {
+	_create_diff_toolbar();
+	if (diff_toolbar) {
+		diff_toolbar->set_visible(true);
+	}
+}
+
+void ScriptTextEditor::_hide_diff_toolbar() {
+	if (diff_toolbar) {
+		diff_toolbar->set_visible(false);
+	}
+}
+
+void ScriptTextEditor::_on_accept_all_pressed() {
+	_apply_all_diff_hunks(true);
+}
+
+void ScriptTextEditor::_on_reject_all_pressed() {
+	_apply_all_diff_hunks(false);
+}
+

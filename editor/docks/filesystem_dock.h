@@ -335,7 +335,7 @@ private:
 	void _tree_empty_click(const Vector2 &p_pos, MouseButton p_button);
 	void _tree_empty_selected();
 
-	void _search(EditorFileSystemDirectory *p_path, List<FileInfo> *matches, int p_max_items);
+	void _search(EditorFileSystemDirectory *p_path, List<EditorFileInfo> *matches, int p_max_items);
 
 	void _set_current_path_line_edit_text(const String &p_path);
 

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "script_editor_plugin.h"
+#include "dtl/dtl.hpp"
 
 #include "editor/gui/code_editor.h"
 #include "scene/gui/color_picker.h"
@@ -54,6 +55,22 @@ public:
 	ConnectionInfoDialog();
 };
 
+// Forward declarations and structures for diff functionality
+struct MyersDiffEdit {
+	enum Type { EQUAL, DELETE, INSERT };
+	Type type;
+	String text;
+	int original_line;
+	int modified_line;
+};
+
+struct DiffDisplayLine {
+	enum Type { UNCHANGED, ADDED, REMOVED };
+	Type type;
+	String content;
+	int line_number;
+};
+
 class ScriptTextEditor : public ScriptEditorBase {
 	GDCLASS(ScriptTextEditor, ScriptEditorBase);
 
@@ -70,6 +87,7 @@ class ScriptTextEditor : public ScriptEditorBase {
 	List<ScriptLanguage::ScriptError> errors;
 	HashMap<String, List<ScriptLanguage::ScriptError>> depended_errors;
 	HashSet<int> safe_lines;
+	HashSet<int> warning_lines;
 
 	List<Connection> missing_connections;
 
@@ -104,6 +122,37 @@ class ScriptTextEditor : public ScriptEditorBase {
 	int line_number_gutter = -1;
 	Color default_line_number_color = Color(1, 1, 1);
 	Color safe_line_number_color = Color(1, 1, 1);
+
+	// Simple diff system - read-only unified diff viewer
+	struct MyersDiffEdit {
+		enum Type { INSERT, DELETE, EQUAL } type = EQUAL;
+		String text;
+		int original_line = 0;
+		int modified_line = 0;
+	};
+	
+	int diff_gutter = -1;  // Keep this for existing gutter code
+	String original_content;
+	String modified_content;
+	bool has_pending_diffs = false;
+
+	// UI controls
+	Control *diff_toolbar = nullptr;
+	Button *accept_all_button = nullptr;
+	Button *reject_all_button = nullptr;
+
+	// Core diff functions
+	void _clear_diff_data();
+	void _apply_all_diff_hunks(bool p_accept);
+	void _create_diff_toolbar();
+	void _show_diff_toolbar();
+	void _hide_diff_toolbar();
+	void _show_unified_diff(const String &p_original, const String &p_modified);
+	void _on_accept_all_pressed();
+	void _on_reject_all_pressed();
+
+	// Additional member variables for unified diff view
+	String unified_content;
 
 	Color marked_line_color = Color(1, 1, 1);
 	Color warning_line_color = Color(1, 1, 1);
@@ -300,6 +349,17 @@ public:
 	Variant get_previous_state();
 	void store_previous_state();
 
+	// Diff system public methods
+	void set_diff(const String &p_original_content, const String &p_modified_content);
+	void clear_diff();
+	bool has_diff() const { return has_pending_diffs; }
+	void apply_accepted_diffs();
+
 	ScriptTextEditor();
 	~ScriptTextEditor();
+
+    // Helper to rebuild file content after per-hunk decisions
+    String _rebuild_content();
+    Vector<String> _orig_lines_cache;
+    Vector<String> _mod_lines_cache;
 };
