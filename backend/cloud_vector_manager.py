@@ -46,7 +46,8 @@ class CloudVectorManager:
         '.ttf', '.otf', '.woff', '.woff2',               # Fonts
         '.zip', '.tar', '.gz', '.rar',                   # Archives
         '.exe', '.dll', '.so', '.dylib',                 # Binaries
-        '.pck', '.pak'                                    # Godot packages
+        '.pck', '.pak',                                   # Godot packages
+        '.uid'                                           # Godot sidecar UID files (never index)
     }
     
     # Patterns for files that tend to be huge and not useful for search
@@ -89,7 +90,7 @@ class CloudVectorManager:
             dataset = self.bq_client.create_dataset(dataset)
             print(f"Created dataset {self.dataset_id}")
         
-        # Create table with vector column
+        # Create embeddings table with vector column
         table_ref = f"{dataset_ref}.{self.table_id}"
         schema = [
             bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
@@ -115,6 +116,45 @@ class CloudVectorManager:
             
             # Create index for faster queries
             self._create_indexes()
+
+        # Create graph tables (nodes, edges)
+        # Nodes (File, SceneNode, Resource, Class etc.)
+        nodes_table_ref = f"{dataset_ref}.graph_nodes"
+        try:
+            self.bq_client.get_table(nodes_table_ref)
+        except NotFound:
+            node_schema = [
+                bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("user_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("project_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("kind", "STRING", mode="REQUIRED"),  # SceneNode | File | Resource | Class
+                bigquery.SchemaField("name", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("node_type", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("node_path", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("start_line", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("end_line", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
+            ]
+            self.bq_client.create_table(bigquery.Table(nodes_table_ref, schema=node_schema))
+
+        # Edges
+        edges_table_ref = f"{dataset_ref}.graph_edges"
+        try:
+            self.bq_client.get_table(edges_table_ref)
+        except NotFound:
+            edge_schema = [
+                bigquery.SchemaField("user_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("project_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("src_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("dst_id", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("kind", "STRING", mode="REQUIRED"),  # CHILD_OF | ATTACHES_SCRIPT | USES_RESOURCE | ...
+                bigquery.SchemaField("file_path", "STRING", mode="REQUIRED"),
+                bigquery.SchemaField("start_line", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("end_line", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("updated_at", "TIMESTAMP", mode="REQUIRED"),
+            ]
+            self.bq_client.create_table(bigquery.Table(edges_table_ref, schema=edge_schema))
     
     def _create_indexes(self):
         """Create indexes for performance"""
@@ -402,6 +442,13 @@ class CloudVectorManager:
                 if errors:
                     print(f"Error inserting rows: {errors}")
                     return False
+
+            # Upsert File node for this file
+            self._upsert_file_node(rel_path, user_id, project_id)
+
+            # Update graph for scenes/resources
+            if rel_path.endswith('.tscn') or rel_path.endswith('.tres'):
+                self._upsert_scene_graph(rel_path, content, user_id, project_id)
             
             return True
             
@@ -573,7 +620,7 @@ class CloudVectorManager:
         )
         SELECT file_path, chunk_index, start_line, end_line, content, similarity
         FROM ranked
-        WHERE rn = 1
+        WHERE rn = 1 AND NOT ENDS_WITH(file_path, '.uid')
         ORDER BY similarity DESC
         LIMIT @max_results
         """
@@ -604,6 +651,73 @@ class CloudVectorManager:
             return []
         
         return results
+
+    def get_graph_context_for_files(self, file_paths: List[str], user_id: str, project_id: str, nodes_limit: int = 20, edges_limit: int = 50) -> Dict[str, Dict]:
+        """Return lightweight graph context (nodes/edges) for each file.
+
+        Limits results per file to keep payload small.
+        """
+        context: Dict[str, Dict] = {}
+        try:
+            dataset_ref = f"{self.gcp_project_id}.{self.dataset_id}"
+            nodes_table = f"{dataset_ref}.graph_nodes"
+            edges_table = f"{dataset_ref}.graph_edges"
+
+            for fp in file_paths:
+                # Nodes
+                q_nodes = f"""
+                SELECT id, kind, name, node_type, node_path, start_line, end_line
+                FROM `{nodes_table}`
+                WHERE user_id = @user_id AND project_id = @project_id AND file_path = @file_path
+                LIMIT @limit_nodes
+                """
+                cfg_nodes = bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                    bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                    bigquery.ScalarQueryParameter("file_path", "STRING", fp),
+                    bigquery.ScalarQueryParameter("limit_nodes", "INTEGER", nodes_limit),
+                ])
+                node_rows = list(self.bq_client.query(q_nodes, job_config=cfg_nodes).result())
+                nodes = []
+                for r in node_rows:
+                    nodes.append({
+                        'id': r.id,
+                        'kind': r.kind,
+                        'name': r.name,
+                        'node_type': r.node_type,
+                        'node_path': r.node_path,
+                        'start_line': r.start_line,
+                        'end_line': r.end_line,
+                    })
+
+                # Edges
+                q_edges = f"""
+                SELECT src_id, dst_id, kind, start_line, end_line
+                FROM `{edges_table}`
+                WHERE user_id = @user_id AND project_id = @project_id AND file_path = @file_path
+                LIMIT @limit_edges
+                """
+                cfg_edges = bigquery.QueryJobConfig(query_parameters=[
+                    bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                    bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                    bigquery.ScalarQueryParameter("file_path", "STRING", fp),
+                    bigquery.ScalarQueryParameter("limit_edges", "INTEGER", edges_limit),
+                ])
+                edge_rows = list(self.bq_client.query(q_edges, job_config=cfg_edges).result())
+                edges = []
+                for r in edge_rows:
+                    edges.append({
+                        'src_id': r.src_id,
+                        'dst_id': r.dst_id,
+                        'kind': r.kind,
+                        'start_line': r.start_line,
+                        'end_line': r.end_line,
+                    })
+
+                context[fp] = {'nodes': nodes, 'edges': edges}
+        except Exception as e:
+            print(f"CloudVector: get_graph_context_for_files error: {e}")
+        return context
     
     def get_stats(self, user_id: str, project_id: str) -> Dict:
         """Get indexing statistics"""
@@ -666,6 +780,12 @@ class CloudVectorManager:
                 content = file_data.get('content', '')
                 file_hash = file_data.get('hash', '')
                 
+                # Hard filter: never index UID sidecar files
+                if file_path.endswith('.uid'):
+                    print(f"CloudVector: Skipping .uid sidecar file: {file_path}")
+                    skipped_files += 1
+                    continue
+
                 if not file_path or not content:
                     print(f"CloudVector: Skipping file with missing path or content")
                     skipped_files += 1
@@ -727,6 +847,13 @@ class CloudVectorManager:
                 else:
                     print(f"CloudVector: ✅ Indexed {file_path} ({len(chunks)} chunks)")
                     indexed_files += 1
+
+                # Upsert File node
+                self._upsert_file_node(file_path, user_id, project_id)
+
+                # Update graph for scenes/resources
+                if file_path.endswith('.tscn') or file_path.endswith('.tres'):
+                    self._upsert_scene_graph(file_path, content, user_id, project_id)
                     
             except Exception as e:
                 print(f"CloudVector: Error processing file {file_data.get('path', 'unknown')}: {e}")
@@ -760,6 +887,218 @@ class CloudVectorManager:
                 start_line=1,
                 end_line=len(content.split('\n'))
             )] if content else []
+
+    def _upsert_scene_graph(self, rel_path: str, content: str, user_id: str, project_id: str):
+        """Parse a .tscn/.tres file and upsert nodes/edges into graph tables.
+
+        Minimal MVP: extract [node ...] blocks and parent-child hierarchy; attach script edges.
+        """
+        try:
+            lines = content.split('\n')
+            dataset_ref = f"{self.gcp_project_id}.{self.dataset_id}"
+            nodes_table = f"{dataset_ref}.graph_nodes"
+            edges_table = f"{dataset_ref}.graph_edges"
+            now_ts = time.time()
+
+            # First, clear prior graph rows for this file (best effort; ignore streaming buffer)
+            for tbl in (nodes_table, edges_table):
+                try:
+                    q = f"""
+                    DELETE FROM `{tbl}`
+                    WHERE user_id = @user_id AND project_id = @project_id AND file_path = @file_path
+                    """
+                    cfg = bigquery.QueryJobConfig(query_parameters=[
+                        bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+                        bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+                        bigquery.ScalarQueryParameter("file_path", "STRING", rel_path),
+                    ])
+                    self.bq_client.query(q, job_config=cfg).result()
+                except Exception as e:
+                    if "streaming buffer" in str(e):
+                        pass
+            # Parse ext_resources first (for PackedScene/Script references)
+            ext_res: Dict[str, Dict[str, str]] = {}
+            for i, line in enumerate(lines, start=1):
+                s = line.strip()
+                if s.startswith('[ext_resource'):
+                    r_type = self._extract_attr(s, 'type') or ''
+                    r_path = self._extract_attr(s, 'path') or ''
+                    r_id = self._extract_attr(s, 'id') or ''
+                    if r_id:
+                        ext_res[r_id] = {'type': r_type, 'path': r_path}
+
+            # Parse nodes
+            nodes = []  # (id, name, type, path, start_line, end_line)
+            edges = []  # (src_id, dst_id, kind, start_line, end_line)
+
+            current_section_start = None
+            current_header = None
+            for i, line in enumerate(lines, start=1):
+                s = line.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    # Close previous section
+                    if current_header and current_section_start:
+                        # Only register node sections
+                        if current_header.startswith('[node'):
+                            name = self._extract_attr(current_header, 'name') or ''
+                            ntype = self._extract_attr(current_header, 'type') or ''
+                            parent_attr = self._extract_attr(current_header, 'parent')
+                            node_attr = self._extract_attr(current_header, 'node')
+                            if node_attr:
+                                npath = node_attr
+                            elif parent_attr and parent_attr != '.':
+                                npath = parent_attr.rstrip('/') + '/' + name
+                            else:
+                                npath = name
+                            node_id = hashlib.md5(f"{project_id}:{rel_path}:{npath}".encode()).hexdigest()
+                            nodes.append((node_id, name, ntype, npath, current_section_start, i - 1))
+                            if parent_attr and parent_attr != '.':
+                                parent_id = hashlib.md5(f"{project_id}:{rel_path}:{parent_attr}".encode()).hexdigest()
+                                edges.append((parent_id, node_id, 'CHILD_OF', current_section_start, i - 1))
+                            elif '/' in npath:
+                                parent_path = npath.rsplit('/', 1)[0]
+                                parent_id = hashlib.md5(f"{project_id}:{rel_path}:{parent_path}".encode()).hexdigest()
+                                edges.append((parent_id, node_id, 'CHILD_OF', current_section_start, i - 1))
+                            inst_id = self._extract_extres_id(current_header)
+                            if inst_id and inst_id in ext_res and ext_res[inst_id]['type'] == 'PackedScene':
+                                target_scene = ext_res[inst_id]['path']
+                                dst_id = hashlib.md5(f"{project_id}:{target_scene}".encode()).hexdigest()
+                                edges.append((node_id, dst_id, 'INSTANTIATES_SCENE', current_section_start, i - 1))
+                    # Open new section
+                    current_header = s
+                    current_section_start = i
+            # Flush last section
+            if current_header and current_section_start and current_header.startswith('[node'):
+                name = self._extract_attr(current_header, 'name') or ''
+                ntype = self._extract_attr(current_header, 'type') or ''
+                parent_attr = self._extract_attr(current_header, 'parent')
+                node_attr = self._extract_attr(current_header, 'node')
+                if node_attr:
+                    npath = node_attr
+                elif parent_attr and parent_attr != '.':
+                    npath = parent_attr.rstrip('/') + '/' + name
+                else:
+                    npath = name
+                node_id = hashlib.md5(f"{project_id}:{rel_path}:{npath}".encode()).hexdigest()
+                nodes.append((node_id, name, ntype, npath, current_section_start, len(lines)))
+                if parent_attr and parent_attr != '.':
+                    parent_id = hashlib.md5(f"{project_id}:{rel_path}:{parent_attr}".encode()).hexdigest()
+                    edges.append((parent_id, node_id, 'CHILD_OF', current_section_start, len(lines)))
+                elif '/' in npath:
+                    parent_path = npath.rsplit('/', 1)[0]
+                    parent_id = hashlib.md5(f"{project_id}:{rel_path}:{parent_path}".encode()).hexdigest()
+                    edges.append((parent_id, node_id, 'CHILD_OF', current_section_start, len(lines)))
+                inst_id = self._extract_extres_id(current_header)
+                if inst_id and inst_id in ext_res and ext_res[inst_id]['type'] == 'PackedScene':
+                    target_scene = ext_res[inst_id]['path']
+                    dst_id = hashlib.md5(f"{project_id}:{target_scene}".encode()).hexdigest()
+                    edges.append((node_id, dst_id, 'INSTANTIATES_SCENE', current_section_start, len(lines)))
+
+            # Attach script edges by scanning lines within node ranges
+            for node_id, name, ntype, npath, start_l, end_l in nodes:
+                for ln in range(start_l - 1, min(end_l, len(lines))):
+                    if 'script =' in lines[ln]:
+                        m = re.search(r'"(res://[^\"]+)"', lines[ln])
+                        if m:
+                            script_path = m.group(1)
+                            dst_id = hashlib.md5(f"{project_id}:{script_path}".encode()).hexdigest()
+                            edges.append((node_id, dst_id, 'ATTACHES_SCRIPT', start_l, end_l))
+                            break
+                        m2 = re.search(r'ExtResource\("([^)\"]+)"\)', lines[ln])
+                        if m2 and m2.group(1) in ext_res and ext_res[m2.group(1)]['type'] in ('Script', 'GDScript', 'CSharpScript'):
+                            script_path = ext_res[m2.group(1)]['path']
+                            dst_id = hashlib.md5(f"{project_id}:{script_path}".encode()).hexdigest()
+                            edges.append((node_id, dst_id, 'ATTACHES_SCRIPT', start_l, end_l))
+                            break
+
+            # Parse connection sections
+            for i, line in enumerate(lines, start=1):
+                s = line.strip()
+                if s.startswith('[connection'):
+                    sig = self._extract_attr(s, 'signal') or ''
+                    from_p = self._extract_attr(s, 'from') or ''
+                    to_p = self._extract_attr(s, 'to') or ''
+                    method = self._extract_attr(s, 'method') or ''
+                    src_id = hashlib.md5(f"{project_id}:{rel_path}:{from_p}".encode()).hexdigest()
+                    dst_id = hashlib.md5(f"{project_id}:{rel_path}:{to_p}".encode()).hexdigest()
+                    kind = f"CONNECTS_SIGNAL:{sig}->{method}" if sig or method else "CONNECTS_SIGNAL"
+                    edges.append((src_id, dst_id, kind, i, i))
+
+            # Insert nodes
+            if nodes:
+                table = self.bq_client.get_table(nodes_table)
+                node_rows = [{
+                    'id': nid,
+                    'user_id': user_id,
+                    'project_id': project_id,
+                    'file_path': rel_path,
+                    'kind': 'SceneNode',
+                    'name': name,
+                    'node_type': ntype,
+                    'node_path': npath,
+                    'start_line': start_l,
+                    'end_line': end_l,
+                    'updated_at': now_ts,
+                } for (nid, name, ntype, npath, start_l, end_l) in nodes]
+                errors = self.bq_client.insert_rows_json(table, node_rows)
+                if errors:
+                    print(f"CloudVector(Graph): Node upsert errors for {rel_path}: {errors}")
+
+            # Insert edges
+            if edges:
+                table = self.bq_client.get_table(edges_table)
+                edge_rows = [{
+                    'user_id': user_id,
+                    'project_id': project_id,
+                    'src_id': src,
+                    'dst_id': dst,
+                    'kind': kind,
+                    'file_path': rel_path,
+                    'start_line': s_l,
+                    'end_line': e_l,
+                    'updated_at': now_ts,
+                } for (src, dst, kind, s_l, e_l) in edges]
+                errors = self.bq_client.insert_rows_json(table, edge_rows)
+                if errors:
+                    print(f"CloudVector(Graph): Edge upsert errors for {rel_path}: {errors}")
+
+            print(f"CloudVector(Graph): Upserted nodes={len(nodes)} edges={len(edges)} for {rel_path}")
+        except Exception as e:
+            print(f"CloudVector: _upsert_scene_graph error for {rel_path}: {e}")
+
+    def _upsert_file_node(self, file_path: str, user_id: str, project_id: str):
+        try:
+            dataset_ref = f"{self.gcp_project_id}.{self.dataset_id}"
+            nodes_table = f"{dataset_ref}.graph_nodes"
+            now_ts = time.time()
+            file_id = hashlib.md5(f"{project_id}:{file_path}".encode()).hexdigest()
+            row = {
+                'id': file_id,
+                'user_id': user_id,
+                'project_id': project_id,
+                'file_path': file_path,
+                'kind': 'File',
+                'name': os.path.basename(file_path),
+                'node_type': None,
+                'node_path': None,
+                'start_line': None,
+                'end_line': None,
+                'updated_at': now_ts,
+            }
+            table = self.bq_client.get_table(nodes_table)
+            self.bq_client.insert_rows_json(table, [row])
+        except Exception as e:
+            print(f"CloudVector(Graph): File node upsert failed for {file_path}: {e}")
+
+    @staticmethod
+    def _extract_attr(header: str, key: str) -> Optional[str]:
+        m = re.search(key + r'\s*=\s*"([^\"]+)"', header)
+        return m.group(1) if m else None
+    
+    @staticmethod
+    def _extract_extres_id(header: str) -> Optional[str]:
+        m = re.search(r'instance\s*=\s*ExtResource\("([^\"]+)"\)', header)
+        return m.group(1) if m else None
     
     def _is_file_already_indexed(self, user_id: str, project_id: str, file_path: str, file_hash: str) -> bool:
         """Check if file is already indexed with the same hash"""

@@ -309,6 +309,7 @@ def search_across_project_internal(arguments: dict, current_user: dict = None) -
         
         # Get parameters
         max_results = arguments.get('max_results', 5)
+        include_graph = bool(arguments.get('include_graph', True))
         project_root = arguments.get('project_root')
         project_id = arguments.get('project_id')
         
@@ -354,12 +355,17 @@ def search_across_project_internal(arguments: dict, current_user: dict = None) -
             "central_files": [],
             "graph_summary": {}
         }
+        graph_context = {}
+        if include_graph and results:
+            files = [r['file_path'] for r in results]
+            graph_context = cloud_vector_manager.get_graph_context_for_files(files, user['id'], project_id)
         
         return {
             "success": True,
             "query": query,
             "results": formatted_results,
-            "include_graph": False,
+            "include_graph": include_graph,
+            "graph": graph_context,
             "file_count": len(results),
             "message": f"Found {len(results)} relevant files for query: {query}"
         }
@@ -1731,13 +1737,19 @@ def embed_endpoint():
                 return jsonify({"error": "query required for search action"}), 400
             
             max_results = data.get('k', 5)
+            include_graph = bool(data.get('include_graph', False))
             results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
+            # Filter out Godot sidecar UID files
+            results = [r for r in results if not str(r.get('file_path','')).endswith('.uid')]
             
             return jsonify({
                 "success": True,
                 "action": "search",
                 "query": query,
-                "results": results
+                "results": results,
+                "graph": cloud_vector_manager.get_graph_context_for_files(
+                    [r.get('file_path') for r in results], user['id'], project_id
+                ) if include_graph else {}
             })
         
         elif action == 'status':
@@ -1808,6 +1820,8 @@ def search_project():
 
         # Search using cloud vector manager
         results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
+        # Filter out Godot sidecar UID files
+        results = [r for r in results if not str(r.get('file_path','')).endswith('.uid')]
 
         # Format results
         formatted_results = {

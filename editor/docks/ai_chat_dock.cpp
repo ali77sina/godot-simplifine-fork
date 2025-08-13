@@ -3032,12 +3032,18 @@ void AIChatDock::_add_tool_response_to_chat(const String &p_tool_call_id, const 
 	toggle_button->set_flat(false);
 	toggle_button->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	toggle_button->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
+	// Prevent long status lines from expanding the dock width
+	toggle_button->set_clip_text(true);
+	toggle_button->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	// Preserve full text in tooltip for accessibility
+	toggle_button->set_tooltip_text(toggle_button->get_text());
 	toggle_button->add_theme_icon_override("icon", get_theme_icon(success ? SNAME("StatusSuccess") : SNAME("StatusError"), SNAME("EditorIcons")));
 	toggle_button->add_theme_color_override("font_color", success ? get_theme_color(SNAME("success_color"), SNAME("Editor")) : get_theme_color(SNAME("error_color"), SNAME("Editor")));
 	tool_container->add_child(toggle_button);
 
 				PanelContainer *content_panel = memnew(PanelContainer);
 	content_panel->set_visible(false); // Collapsed by default.
+	content_panel->set_clip_contents(true);
 				tool_container->add_child(content_panel);
 				toggle_button->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_output_toggled).bind(content_panel));
 
@@ -4122,19 +4128,239 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 				file_link->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_file_link_pressed).bind(file_path));
 				file_hbox->add_child(file_link);
 				
-				// Similarity score
-				Label *score_label = memnew(Label);
-				score_label->set_text(String::num(similarity, 3) + " (" + modality + ")");
-				score_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
-				score_label->set_custom_minimum_size(Size2(120, 0));
-				file_hbox->add_child(score_label);
+                // Hide similarity score for a cleaner UI
 
-                // Chunk range (if present)
+                // Try to display scene node/component name for .tscn/.tres sections
+                // Extract a header line around chunk_start for readability
+                String node_hint;
+                if (file_path.ends_with(".tscn") || file_path.ends_with(".tres")) {
+                    String abs_path = ProjectSettings::get_singleton()->globalize_path(file_path);
+                    Ref<FileAccess> f = FileAccess::open(abs_path, FileAccess::READ);
+                    if (f.is_valid()) {
+                        // Read up to chunk_end, but only scan nearby lines for section header
+                        Vector<String> lines;
+                        int64_t max_lines_to_read = chunk_end > 0 ? chunk_end : (chunk_start + 20);
+                        for (int64_t ln = 1; ln <= max_lines_to_read && !f->eof_reached(); ln++) {
+                            lines.push_back(f->get_line());
+                        }
+                        // Look backwards from chunk_start for a line that starts a section
+                        int64_t idx = MAX((int64_t)0, chunk_start - 1);
+                        for (int64_t i = idx; i >= 0 && i >= idx - 20; i--) {
+                            if (i < lines.size()) {
+                                String l = lines[i].strip_edges();
+                                if (l.begins_with("[node")) {
+                                    // Extract clean node info: name and type
+                                    String clean_hint = "";
+                                    int name_idx = l.find("name=\"");
+                                    int type_idx = l.find("type=\"");
+                                    
+                                    if (name_idx != -1) {
+                                        int start = name_idx + 6;
+                                        int end = l.find("\"", start + 1);
+                                        String name = end > start ? l.substr(start + 1, end - start - 1) : String("Node");
+                                        clean_hint = "🎯 " + name;
+                                    }
+                                    
+                                    if (type_idx != -1) {
+                                        int start = type_idx + 6;
+                                        int end = l.find("\"", start + 1);
+                                        String type = end > start ? l.substr(start + 1, end - start - 1) : String("Node");
+                                        if (!clean_hint.is_empty() && type != "Node") {
+                                            clean_hint += " (" + type + ")";
+                                        } else if (clean_hint.is_empty()) {
+                                            clean_hint = "🎯 " + type;
+                                        }
+                                    }
+                                    
+                                    node_hint = clean_hint.is_empty() ? "🎯 Scene Node" : clean_hint;
+                                    break;
+                                } else if (l.begins_with("[sub_resource")) {
+                                    // Clean display: extract just the resource type
+                                    int type_idx = l.find("type=\"");
+                                    if (type_idx != -1) {
+                                        int start = type_idx + 6; // after type="
+                                        int end = l.find("\"", start + 1);
+                                        String t = end > start ? l.substr(start + 1, end - start - 1) : String("Resource");
+                                        node_hint = "🔧 " + t + " Resource";
+                                    } else {
+                                        node_hint = "🔧 Sub Resource";
+                                    }
+                                    break;
+                                } else if (l.begins_with("[ext_resource")) {
+                                    // Clean display for external resources
+                                    int type_idx = l.find("type=\"");
+                                    if (type_idx != -1) {
+                                        int start = type_idx + 6;
+                                        int end = l.find("\"", start + 1);
+                                        String t = end > start ? l.substr(start + 1, end - start - 1) : String("Resource");
+                                        node_hint = "📦 " + t + " (External)";
+                                    } else {
+                                        node_hint = "📦 External Resource";
+                                    }
+                                    break;
+                                } else if (l.begins_with("[resource")) {
+                                    node_hint = "📄 Main Resource";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                HBoxContainer *meta_box = memnew(HBoxContainer);
+                file_hbox->add_child(meta_box);
+                if (!node_hint.is_empty()) {
+                    Label *node_label = memnew(Label);
+                    node_label->set_text(node_hint);
+                    node_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
+                    meta_box->add_child(node_label);
+                }
+                // Line range (if present): show as [1-2]
                 if (chunk_start >= 0 && chunk_end > chunk_start) {
                     Label *range_label = memnew(Label);
-                    range_label->set_text(vformat("[chunk %d: %d-%d]", (int)chunk_index, (int)chunk_start, (int)chunk_end));
+                    range_label->set_text(vformat(" [%d-%d]", (int)chunk_start, (int)chunk_end));
                     range_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.6));
-                    file_hbox->add_child(range_label);
+                    meta_box->add_child(range_label);
+                }
+
+                // Simple structure view for scenes/resources
+                if (p_result.has("graph") && p_result["graph"].get_type() == Variant::DICTIONARY) {
+                    Dictionary graph_map = p_result["graph"];
+                    if (graph_map.has(file_path) && graph_map[file_path].get_type() == Variant::DICTIONARY) {
+                        Dictionary fg = graph_map[file_path];
+                        Array g_nodes = fg.get("nodes", Array());
+                        Array g_edges = fg.get("edges", Array());
+
+                        // Find scene nodes and connections
+                        Array scene_nodes;
+                        HashMap<String, String> node_scripts; // node_id -> script_path
+                        HashMap<String, Array> connections;  // node_id -> array of connected target names
+                        
+                        for (int ni = 0; ni < g_nodes.size(); ni++) {
+                            Dictionary nd = g_nodes[ni];
+                            String nkind = nd.get("kind", "");
+                            if (nkind == "SceneNode") {
+                                scene_nodes.push_back(nd);
+                            }
+                        }
+
+                        // Build connection and script maps
+                        for (int ei = 0; ei < g_edges.size(); ei++) {
+                            Dictionary ed = g_edges[ei];
+                            String ek = ed.get("kind", "");
+                            String src_id = ed.get("src_id", "");
+                            String dst_id = ed.get("dst_id", "");
+                            
+                            if (ek == "CONNECTS_SIGNAL" && !src_id.is_empty() && !dst_id.is_empty()) {
+                                if (!connections.has(src_id)) {
+                                    connections[src_id] = Array();
+                                }
+                                // Find target node name
+                                for (int ni = 0; ni < g_nodes.size(); ni++) {
+                                    Dictionary nd = g_nodes[ni];
+                                    if (nd.get("id", "") == dst_id) {
+                                        String target_name = nd.get("name", "unknown");
+                                        connections[src_id].push_back(target_name);
+                                        break;
+                                    }
+                                }
+                            } else if (ek == "ATTACHES_SCRIPT" && !src_id.is_empty() && !dst_id.is_empty()) {
+                                // Find script file path
+                                for (int ni = 0; ni < g_nodes.size(); ni++) {
+                                    Dictionary nd = g_nodes[ni];
+                                    if (nd.get("id", "") == dst_id && nd.get("kind", "") == "File") {
+                                        String script_path = nd.get("file_path", "");
+                                        if (!script_path.is_empty()) {
+                                            node_scripts[src_id] = script_path.get_file(); // Just filename
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (scene_nodes.size() > 0) {
+                            // Toggle button - more friendly name
+                            Button *structure_toggle = memnew(Button);
+                            structure_toggle->set_text("Structure");
+                            structure_toggle->set_tooltip_text("Show scene nodes and their connections");
+                            structure_toggle->add_theme_icon_override("icon", get_theme_icon(SNAME("SceneTree"), SNAME("EditorIcons")));
+                            file_hbox->add_child(structure_toggle);
+
+                            // Collapsible box
+                            VBoxContainer *structure_box = memnew(VBoxContainer);
+                            structure_box->set_visible(false);
+                            search_vbox->add_child(structure_box);
+
+                            // Show scene nodes in a clean tree-like format
+                            int max_show = 6;
+                            for (int ni = 0; ni < MIN(max_show, scene_nodes.size()); ni++) {
+                                Dictionary nd = scene_nodes[ni];
+                                String nname = nd.get("name", "");
+                                String ntype = nd.get("node_type", "");
+                                String npath = nd.get("node_path", "");
+                                String node_id = nd.get("id", "");
+
+                                VBoxContainer *node_vbox = memnew(VBoxContainer);
+                                structure_box->add_child(node_vbox);
+
+                                HBoxContainer *node_hbox = memnew(HBoxContainer);
+                                node_vbox->add_child(node_hbox);
+
+                                // Indent based on path depth
+                                int depth = npath.get_slice_count("/") - 1;
+                                String indent = "";
+                                for (int d = 0; d < depth; d++) {
+                                    indent += "  ";
+                                }
+
+                                Label *node_label = memnew(Label);
+                                String display_text = indent + "📄 " + nname;
+                                if (!ntype.is_empty() && ntype != "Node") {
+                                    display_text += " (" + ntype + ")";
+                                }
+                                node_label->set_text(display_text);
+                                node_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(0.9, 0.9, 1.0, 0.9));
+                                node_hbox->add_child(node_label);
+
+                                // Show script attachment
+                                if (node_scripts.has(node_id)) {
+                                    Label *script_label = memnew(Label);
+                                    script_label->set_text(" 📜 " + node_scripts[node_id]);
+                                    script_label->add_theme_color_override("font_color", get_theme_color(SNAME("warning_color"), SNAME("Editor")) * Color(1, 1, 1, 0.8));
+                                    node_hbox->add_child(script_label);
+                                }
+
+                                // Show signal connections
+                                if (connections.has(node_id)) {
+                                    Array targets = connections[node_id];
+                                    if (targets.size() > 0) {
+                                        HBoxContainer *conn_hbox = memnew(HBoxContainer);
+                                        node_vbox->add_child(conn_hbox);
+                                        
+                                        Label *conn_label = memnew(Label);
+                                        String conn_text = indent + "  ↳ signals to: ";
+                                        for (int ti = 0; ti < targets.size(); ti++) {
+                                            if (ti > 0) conn_text += ", ";
+                                            conn_text += String(targets[ti]);
+                                        }
+                                        conn_label->set_text(conn_text);
+                                        conn_label->add_theme_color_override("font_color", get_theme_color(SNAME("accent_color"), SNAME("Editor")) * Color(1, 1, 1, 0.7));
+                                        conn_hbox->add_child(conn_label);
+                                    }
+                                }
+                            }
+
+                            if (scene_nodes.size() > max_show) {
+                                Label *more_label = memnew(Label);
+                                more_label->set_text("... and " + String::num_int64(scene_nodes.size() - max_show) + " more nodes");
+                                more_label->add_theme_color_override("font_color", get_theme_color(SNAME("font_color"), SNAME("Editor")) * Color(1, 1, 1, 0.5));
+                                structure_box->add_child(more_label);
+                            }
+
+                            structure_toggle->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_output_toggled).bind(structure_box));
+                        }
+                    }
                 }
 			}
 		}
@@ -4295,12 +4521,18 @@ void AIChatDock::_apply_tool_result_deferred(const String &p_tool_call_id, const
 	toggle_button->set_flat(false);
 	toggle_button->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	toggle_button->set_text_alignment(HORIZONTAL_ALIGNMENT_LEFT);
+	// Prevent long status lines from expanding the dock width
+	toggle_button->set_clip_text(true);
+	toggle_button->set_text_overrun_behavior(TextServer::OVERRUN_TRIM_ELLIPSIS);
+	// Preserve full text in tooltip for accessibility
+	toggle_button->set_tooltip_text(toggle_button->get_text());
 	toggle_button->add_theme_icon_override("icon", get_theme_icon(success ? SNAME("StatusSuccess") : SNAME("StatusError"), SNAME("EditorIcons")));
 	toggle_button->add_theme_color_override("font_color", success ? get_theme_color(SNAME("success_color"), SNAME("Editor")) : get_theme_color(SNAME("error_color"), SNAME("Editor")));
 	tool_container->add_child(toggle_button);
 
 	PanelContainer *content_panel = memnew(PanelContainer);
 	content_panel->set_visible(false); // Collapsed by default
+	content_panel->set_clip_contents(true);
 	tool_container->add_child(content_panel);
 	toggle_button->connect("pressed", callable_mp(this, &AIChatDock::_on_tool_output_toggled).bind(content_panel));
 
