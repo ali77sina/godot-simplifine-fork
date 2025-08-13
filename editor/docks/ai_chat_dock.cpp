@@ -141,10 +141,8 @@ void AIChatDock::_notification(int p_notification) {
 			top_container->add_child(model_label);
 
             model_dropdown = memnew(OptionButton);
-            model_dropdown->add_item("gpt-4o");
+            model_dropdown->add_item("gpt-5");
 			model_dropdown->add_item("gpt-4o");
-			model_dropdown->add_item("gpt-4-turbo");
-			model_dropdown->add_item("gpt-3.5-turbo");
 			model_dropdown->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 			model_dropdown->connect("item_selected", callable_mp(this, &AIChatDock::_on_model_selected));
 			top_container->add_child(model_dropdown);

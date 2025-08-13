@@ -1,0 +1,22 @@
+Orca Engine
+
+Copyright © 2025 Simplifine Corp.
+
+This project includes and is based on Godot Engine:
+- © 2014–present Godot Engine contributors
+- © 2007–2014 Juan Linietsky, Ariel Manzur
+Licensed under the Expat (MIT) License. See `LICENSE.txt`.
+
+Licensing summary
+- Upstream Godot Engine code: Expat (MIT) (see `LICENSE.txt`)
+- Third-party components: see `COPYRIGHT.txt` and licenses under `thirdparty/`
+- Simplifine original contributions identified in this NOTICE and file headers: Company Non-Commercial License (see `LICENSES/COMPANY-NONCOMMERCIAL.md`)
+
+Commercial licensing
+Commercial use of Simplifine’s original contributions requires a separate license.
+Contact: support@simplifine.com
+
+Trademarks
+Godot Engine, and any related names, logos, and brands are property of their respective owners. No trademark rights are granted by this NOTICE.
+
+

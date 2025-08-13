@@ -21,4 +21,5 @@ ENV FLASK_ENV=production
 
 # Run the application with Gunicorn (Cloud Run provides PORT)
 ENV PORT=8080
-CMD ["gunicorn", "--bind", "0.0.0.0:${PORT}", "--workers", "2", "--threads", "8", "--timeout", "120", "app:app"]
+# Use shell form so $PORT is expanded at runtime by the shell
+CMD ["sh", "-c", "exec gunicorn --bind :$PORT --workers 2 --threads 8 --timeout 120 app:app"]
