@@ -8,6 +8,10 @@ import numpy as np
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 import re
+import threading
+import math
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 @dataclass
 class TextChunk:
@@ -71,6 +75,14 @@ class CloudVectorManager:
             raise ValueError("OpenAI client is required")
         
         print("Using OpenAI embeddings (text-embedding-3-small)")
+        # Tunables
+        self.embed_batch_size = int(os.getenv('EMBED_BATCH_SIZE', '100'))
+        self.max_embed_parallel = int(os.getenv('EMBED_MAX_PARALLEL', '4'))
+        # Concurrency guard for outbound embedding calls
+        self._embed_semaphore = threading.Semaphore(self.max_embed_parallel)
+        # Default worker pool size for indexing
+        default_workers = (os.cpu_count() or 4) * 2
+        self.default_index_workers = int(os.getenv('INDEX_MAX_WORKERS', str(min(32, default_workers))))
         
         # Initialize BigQuery client
         self.bq_client = bigquery.Client(project=gcp_project_id)
@@ -326,27 +338,43 @@ class CloudVectorManager:
         return chunks
     
     def _generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using OpenAI"""
-        # OpenAI has a batch limit, process in smaller chunks
-        batch_size = 20
-        all_embeddings = []
+        """Generate embeddings using OpenAI with batching, throttling, and retries.
+
+        Note: If a batch fails after retries, its items are skipped and will reduce the
+        number of returned embeddings. Callers should not assume 1:1 length on failure.
+        """
+        if not texts:
+            return []
+        batch_size = max(1, self.embed_batch_size)
+        all_embeddings: List[List[float]] = []
         
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            # Truncate long texts to OpenAI's limit
+            # Truncate long texts to protect against token limits
             batch = [t[:8000] if len(t) > 8000 else t for t in batch]
-            
-            try:
-                response = self.openai_client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=batch
-                )
-                for data in response.data:
-                    all_embeddings.append(data.embedding)
-            except Exception as e:
-                print(f"Error generating embeddings: {e}")
-                # Skip failed batches entirely rather than adding zero vectors
-                continue
+
+            # Throttle concurrent batches
+            with self._embed_semaphore:
+                # Basic retry with exponential backoff and jitter
+                max_attempts = 3
+                attempt = 0
+                while True:
+                    try:
+                        response = self.openai_client.embeddings.create(
+                            model="text-embedding-3-small",
+                            input=batch
+                        )
+                        for data in response.data:
+                            all_embeddings.append(data.embedding)
+                        break
+                    except Exception as e:
+                        attempt += 1
+                        if attempt >= max_attempts:
+                            print(f"Error generating embeddings (final): {e}")
+                            break
+                        sleep_s = (2 ** attempt) + random.uniform(0, 0.25)
+                        print(f"Embedding batch failed (attempt {attempt}), retrying in {sleep_s:.2f}s: {e}")
+                        time.sleep(sleep_s)
         
         return all_embeddings
     
@@ -456,8 +484,11 @@ class CloudVectorManager:
             print(f"Error indexing {file_path}: {e}")
             return False
     
-    def index_project(self, project_root: str, user_id: str, project_id: str, force_reindex: bool = False) -> Dict[str, int]:
-        """Index all files in project"""
+    def index_project(self, project_root: str, user_id: str, project_id: str, force_reindex: bool = False, max_workers: Optional[int] = None) -> Dict[str, int]:
+        """Index all files in project, using parallel workers.
+
+        max_workers controls parallelism (defaults to INDEX_MAX_WORKERS env or CPU heuristic).
+        """
         stats = {
             'total': 0,
             'indexed': 0,
@@ -465,41 +496,56 @@ class CloudVectorManager:
             'failed': 0,
             'removed': 0
         }
-        
-        # Walk through project directory
+        files_to_index: List[str] = []
         current_rel_paths: Set[str] = set()
+
+        # First pass: enumerate files and prefilter
         for root, dirs, files in os.walk(project_root):
-            # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
             for file in files:
                 file_path = os.path.join(root, file)
                 stats['total'] += 1
-                
                 if not self._should_index_file(file_path):
                     stats['skipped'] += 1
                     continue
-                
-                # Track relative path for later deletion sync
                 try:
                     rel_path = os.path.relpath(file_path, project_root)
                 except Exception:
                     rel_path = file
                 current_rel_paths.add(rel_path)
-
                 if force_reindex:
-                    # Ensure prior chunks are removed to rebuild fresh
                     try:
                         self._remove_existing_file_chunks(user_id, project_id, rel_path)
                     except Exception:
                         pass
+                files_to_index.append(file_path)
 
-                if self.index_file(file_path, user_id, project_id, project_root):
-                    stats['indexed'] += 1
-                else:
-                    stats['skipped'] += 1
-        
-        # After indexing, remove entries for files that no longer exist in the project
+        # Second pass: parallel indexing of files
+        if files_to_index:
+            workers = max_workers or self.default_index_workers
+            indexed_count = 0
+            skipped_or_failed = 0
+
+            def _worker(fp: str) -> bool:
+                try:
+                    return self.index_file(fp, user_id, project_id, project_root)
+                except Exception as e:
+                    print(f"CloudVector: Exception indexing {fp}: {e}")
+                    return False
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_worker, fp) for fp in files_to_index]
+                for fut in as_completed(futures):
+                    ok = fut.result()
+                    if ok:
+                        indexed_count += 1
+                    else:
+                        skipped_or_failed += 1
+
+            stats['indexed'] += indexed_count
+            stats['skipped'] += skipped_or_failed
+
+        # Cleanup: remove entries for files no longer present
         try:
             removed_count = self._remove_missing_files(user_id, project_id, current_rel_paths)
             stats['removed'] = removed_count
@@ -766,60 +812,57 @@ class CloudVectorManager:
         
         self.bq_client.query(query, job_config=job_config).result()
     
-    def index_files_with_content(self, files_data: List[Dict], user_id: str, project_id: str) -> Dict:
-        """Index files using content provided in the request (cloud-ready)"""
+    def index_files_with_content(self, files_data: List[Dict], user_id: str, project_id: str, max_workers: Optional[int] = None) -> Dict:
+        """Index files using provided content, processed in parallel per file."""
         print(f"CloudVector: Indexing {len(files_data)} files with provided content")
-        
+
         indexed_files = 0
-        skipped_files = 0 
+        skipped_files = 0
         failed_files = 0
-        
-        for file_data in files_data:
+
+        # Worker to process a single file_data dict
+        def _process_file(fd: Dict) -> Tuple[str, int, int, int]:
             try:
-                file_path = file_data.get('path', '')
-                content = file_data.get('content', '')
-                file_hash = file_data.get('hash', '')
-                
-                # Hard filter: never index UID sidecar files
+                file_path = fd.get('path', '')
+                content = fd.get('content', '')
+                file_hash = fd.get('hash', '')
+
+                # Never index .uid sidecar
                 if file_path.endswith('.uid'):
                     print(f"CloudVector: Skipping .uid sidecar file: {file_path}")
-                    skipped_files += 1
-                    continue
+                    return (file_path, 0, 1, 0)
 
                 if not file_path or not content:
                     print(f"CloudVector: Skipping file with missing path or content")
-                    skipped_files += 1
-                    continue
-                
-                # Check if already indexed with same content hash
+                    return (file_path or 'unknown', 0, 1, 0)
+
+                # Skip unchanged
                 if self._is_file_already_indexed(user_id, project_id, file_path, file_hash):
                     print(f"CloudVector: Skipping unchanged file: {file_path}")
-                    skipped_files += 1
-                    continue
-                
-                # Remove existing entries for this file
-                self._remove_existing_file_chunks(user_id, project_id, file_path)
-                
-                # Create chunks from content
+                    return (file_path, 0, 1, 0)
+
+                # Remove existing entries for this file (best effort)
+                try:
+                    self._remove_existing_file_chunks(user_id, project_id, file_path)
+                except Exception:
+                    pass
+
+                # Chunk
                 chunks = self._create_text_chunks(content, file_path)
                 if not chunks:
                     print(f"CloudVector: No chunks created for {file_path}")
-                    skipped_files += 1
-                    continue
-                
-                # Generate embeddings for chunks
+                    return (file_path, 0, 1, 0)
+
+                # Embed
                 chunk_texts = [chunk.content for chunk in chunks]
                 embeddings = self._generate_embeddings_batch(chunk_texts)
-                
                 if len(embeddings) != len(chunks):
-                    print(f"CloudVector: Embedding count mismatch for {file_path}")
-                    failed_files += 1
-                    continue
-                
-                # Insert into BigQuery
+                    print(f"CloudVector: Embedding count mismatch for {file_path} ({len(embeddings)} vs {len(chunks)})")
+                    return (file_path, 0, 0, 1)
+
+                # Insert
                 rows_to_insert = []
                 current_time = time.time()
-                
                 for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                     row = {
                         'id': f"{user_id}:{project_id}:{file_path}:{i}",
@@ -835,32 +878,35 @@ class CloudVectorManager:
                         'embedding': embedding
                     }
                     rows_to_insert.append(row)
-                
-                # Insert batch
                 table_ref = f"{self.gcp_project_id}.{self.dataset_id}.{self.table_id}"
                 table = self.bq_client.get_table(table_ref)
                 errors = self.bq_client.insert_rows_json(table, rows_to_insert)
-                
                 if errors:
                     print(f"CloudVector: Error inserting {file_path}: {errors}")
-                    failed_files += 1
-                else:
-                    print(f"CloudVector: ✅ Indexed {file_path} ({len(chunks)} chunks)")
-                    indexed_files += 1
+                    return (file_path, 0, 0, 1)
 
-                # Upsert File node
+                # Upserts
                 self._upsert_file_node(file_path, user_id, project_id)
-
-                # Update graph for scenes/resources
                 if file_path.endswith('.tscn') or file_path.endswith('.tres'):
                     self._upsert_scene_graph(file_path, content, user_id, project_id)
-                    
+
+                print(f"CloudVector: ✅ Indexed {file_path} ({len(chunks)} chunks)")
+                return (file_path, 1, 0, 0)
             except Exception as e:
-                print(f"CloudVector: Error processing file {file_data.get('path', 'unknown')}: {e}")
-                failed_files += 1
-        
+                print(f"CloudVector: Error processing file {fd.get('path', 'unknown')}: {e}")
+                return (fd.get('path', 'unknown'), 0, 0, 1)
+
+        workers = max_workers or self.default_index_workers
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_process_file, fd) for fd in files_data]
+            for fut in as_completed(futures):
+                _fp, idx, skp, fld = fut.result()
+                indexed_files += idx
+                skipped_files += skp
+                failed_files += fld
+
         print(f"CloudVector: Batch complete - indexed: {indexed_files}, skipped: {skipped_files}, failed: {failed_files}")
-        
+
         return {
             'total': len(files_data),
             'indexed': indexed_files,

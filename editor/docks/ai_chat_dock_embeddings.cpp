@@ -7,6 +7,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/json.h"
 #include "editor/file_system/editor_file_system.h"
+#include "editor/settings/editor_settings.h"
 
 // Helper: derive backend base URL from chat endpoint
 static String _get_backend_base_url(const String &p_chat_endpoint) {
@@ -18,15 +19,22 @@ static String _get_backend_base_url(const String &p_chat_endpoint) {
 }
 
 String AIChatDock::_get_embed_base_url() {
-    // Force local backend for development
-    String is_dev = OS::get_singleton()->get_environment("IS_DEV");
-    if (is_dev.is_empty()) {
-        is_dev = OS::get_singleton()->get_environment("DEV_MODE");
+    // Resolve base URL with priority: EditorSettings -> env AI_CHAT_CLOUD_URL -> localhost
+    String base_url;
+    if (EditorSettings::get_singleton() && EditorSettings::get_singleton()->has_setting("ai_chat/base_url")) {
+        base_url = EditorSettings::get_singleton()->get_setting("ai_chat/base_url");
     }
-    if (!is_dev.is_empty() && is_dev.to_lower() == "true") {
-        return String("http://127.0.0.1:8000");
+    if (base_url.is_empty()) {
+        base_url = OS::get_singleton()->get_environment("AI_CHAT_CLOUD_URL");
     }
-    return String("https://gamechat.simplifine.com");
+    if (base_url.is_empty()) {
+        base_url = "http://127.0.0.1:8000";
+    }
+    // Normalize: strip trailing slash
+    if (base_url.ends_with("/")) {
+        base_url = base_url.substr(0, base_url.length() - 1);
+    }
+    return base_url;
 }
 
 void AIChatDock::_initialize_embedding_system() {
@@ -117,13 +125,14 @@ void AIChatDock::_remove_file_embedding(const String &p_file_path) {
     _send_embedding_request("remove_file", payload);
 }
 
-void AIChatDock::_send_embedding_request(const String &p_path, const Dictionary &p_data) {
+void AIChatDock::_send_embedding_request(const String &p_action, const Dictionary &p_data) {
     if (!embedding_request) {
         return;
     }
 
     String base = _get_embed_base_url();
-    String url = base + p_path;
+    // Always use /embed; action is provided in body
+    String url = base + "/embed";
 
     PackedStringArray headers;
     headers.push_back("Content-Type: application/json");
@@ -138,8 +147,9 @@ void AIChatDock::_send_embedding_request(const String &p_path, const Dictionary 
         headers.push_back("X-User-ID: " + current_user_id);
     }
 
-    // Also include machine_id in body for safety (backend supports both)
+    // Include action and machine/project context in body
     Dictionary body = p_data;
+    body["action"] = p_action;
     if (!body.has("project_root")) {
         body["project_root"] = _get_project_root_path();
     }
@@ -148,7 +158,7 @@ void AIChatDock::_send_embedding_request(const String &p_path, const Dictionary 
     }
 
     String json = JSON::stringify(body);
-    print_line(vformat("AI Chat: 📤 Embedding request %s -> %s", (String)p_data.get("action", ""), url));
+    print_line(vformat("AI Chat: 📤 Embedding request %s -> %s", p_action, url));
     print_line(vformat("AI Chat: 📁 project_root=%s", body.get("project_root", "")));
     embedding_request_busy = true;
     Error err = embedding_request->request(url, headers, HTTPClient::METHOD_POST, json);

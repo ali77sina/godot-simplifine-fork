@@ -37,7 +37,18 @@ def cleanup_old_requests():
             del ACTIVE_REQUESTS[req_id]
 
 app = Flask(__name__)
-app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
+# Secret must be stable across restarts in production. Require env in production, random only in DEV_MODE.
+_dev_mode = os.getenv('DEV_MODE', 'false').lower() == 'true'
+DEPLOYMENT_MODE = os.getenv('DEPLOYMENT_MODE', 'oss').lower()  # 'oss' or 'cloud'
+REQUIRE_SERVER_API_KEY = os.getenv('REQUIRE_SERVER_API_KEY', 'false').lower() == 'true'
+SERVER_API_KEY = os.getenv('SERVER_API_KEY')
+_secret_env = os.getenv('FLASK_SECRET_KEY')
+if _secret_env:
+    app.secret_key = _secret_env
+elif _dev_mode:
+    app.secret_key = os.urandom(24)
+else:
+    raise ValueError("FLASK_SECRET_KEY must be set in production")
 
 # Get OpenAI API key from environment variable
 api_key = os.getenv('OPENAI_API_KEY')
@@ -54,10 +65,10 @@ auth_manager = AuthManager()
 
 # Initialize Cloud Vector Manager
 GCP_PROJECT_ID = os.getenv('GCP_PROJECT_ID')
-if not GCP_PROJECT_ID:
-    raise ValueError("GCP_PROJECT_ID environment variable is required")
-
-cloud_vector_manager = CloudVectorManager(GCP_PROJECT_ID, client)
+CLOUD_VECTOR_ENABLED = bool(GCP_PROJECT_ID)
+cloud_vector_manager = None
+if CLOUD_VECTOR_ENABLED:
+    cloud_vector_manager = CloudVectorManager(GCP_PROJECT_ID, client)
 
 # Load system prompt from file (once at startup)
 SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), 'system_prompt.txt')
@@ -105,7 +116,33 @@ def verify_authentication():
         if user:
             return user, None, None
     
+    # Guest fallback if allowed
+    # Default: OSS mode allows guests; cloud mode disables by default unless explicitly enabled
+    default_allow = (DEPLOYMENT_MODE != 'cloud')
+    allow_guests = os.getenv('ALLOW_GUESTS', 'true' if default_allow else 'false').lower() == 'true'
+    request_allows_guest = (request.headers.get('X-Allow-Guest', 'true').lower() == 'true')
+    if allow_guests and request_allows_guest:
+        guest_name = request.headers.get('X-Guest-Name')
+        guest_result = auth_manager.create_or_get_guest_session(machine_id, guest_name)
+        if guest_result.get('success'):
+            return guest_result['user'], None, None
+        else:
+            return None, {"error": f"Guest session failed: {guest_result.get('error','unknown')}", "success": False}, 401
+    
     return None, {"error": "Authentication required", "success": False}, 401
+
+
+def verify_server_key_if_required():
+    """Optional server-side API key gate for sensitive endpoints."""
+    if not REQUIRE_SERVER_API_KEY:
+        return None
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({"success": False, "error": "Server API key required"}), 401
+    token = auth_header[7:]
+    if not SERVER_API_KEY or token != SERVER_API_KEY:
+        return jsonify({"success": False, "error": "Invalid server API key"}), 403
+    return None
 
 # Image handling will use OpenAI's native ID system - no local registry needed
 
@@ -961,6 +998,10 @@ def stop_chat():
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Optional server key gate
+    gate = verify_server_key_if_required()
+    if gate is not None:
+        return gate
     """
     Main chat endpoint that handles the full conversation flow:
     1. Receives messages from Godot
@@ -1382,6 +1423,9 @@ def chat():
 
 @app.route('/generate_script', methods=['POST'])
 def generate_script():
+    gate = verify_server_key_if_required()
+    if gate is not None:
+        return gate
     """Generate script content using AI"""
     data = request.json
     script_type = data.get('script_type', '')
@@ -1461,6 +1505,9 @@ def generate_script():
 
 @app.route('/predict_code_edit', methods=['POST'])
 def predict_code_edit():
+    gate = verify_server_key_if_required()
+    if gate is not None:
+        return gate
     """
     Uses OpenAI's Predicted Outputs feature to edit code files.
     Provides the original file content as prediction and returns the complete edited file.
@@ -1525,6 +1572,37 @@ def auth_login():
             auth_url = auth_manager.get_google_auth_url(machine_id)
         elif provider == 'github':
             auth_url = auth_manager.get_github_auth_url(machine_id)
+        elif provider == 'microsoft':
+            auth_url = auth_manager.get_microsoft_auth_url(machine_id)
+        elif provider == 'guest':
+            # Create/return guest session immediately
+            result = auth_manager.create_or_get_guest_session(machine_id)
+            if result.get('success'):
+                # Return a small HTML page that the editor can parse, similar to callback flow
+                user = result['user']
+                token = result['token']
+                return f"""
+                <html>
+                <body>
+                    <h1>Guest Session Ready</h1>
+                    <p>Welcome, {user['name']}!</p>
+                    <script>
+                        // Communicate token and user back to opener if needed
+                        try {{
+                            window.opener && window.opener.postMessage({{
+                                type: 'auth_success',
+                                provider: 'guest',
+                                user: {json.dumps(user)},
+                                token: '{token}'
+                            }}, '*');
+                        }} catch(e) {{}}
+                        window.close();
+                    </script>
+                </body>
+                </html>
+                """
+            else:
+                return jsonify({"error": result.get('error','Guest session failed'), "success": False}), 500
         else:
             return jsonify({"error": "Unsupported provider"}), 400
         
@@ -1561,6 +1639,8 @@ def auth_callback():
             result = auth_manager.handle_google_callback(state, code)
         elif provider == 'github':
             result = auth_manager.handle_github_callback(state, code)
+        elif provider == 'microsoft':
+            result = auth_manager.handle_microsoft_callback(state, code)
         else:
             return "<html><body><h1>Authentication Error</h1><p>Invalid provider</p></body></html>", 400
         
@@ -1590,6 +1670,8 @@ def auth_status():
     try:
         data = request.json
         machine_id = data.get('machine_id')
+        require_provider = data.get('require_provider')
+        allow_guest = data.get('allow_guest', True)
         
         if not machine_id:
             return jsonify({"error": "machine_id required", "success": False}), 400
@@ -1597,6 +1679,20 @@ def auth_status():
         user_data = auth_manager.get_user_by_machine_id(machine_id)
         
         if user_data:
+            user = user_data['user']
+            # If a specific provider is required, ensure it matches
+            if require_provider and user.get('provider') != require_provider:
+                return jsonify({
+                    "success": False,
+                    "error": "Authenticated session exists but with a different provider",
+                    "current_provider": user.get('provider')
+                }), 401
+            # Optionally disallow guest while polling for OAuth
+            if not allow_guest and user.get('provider') == 'guest':
+                return jsonify({
+                    "success": False,
+                    "error": "Guest session present; awaiting OAuth provider"
+                }), 401
             return jsonify({
                 "success": True,
                 "user": user_data['user'],
@@ -1610,6 +1706,32 @@ def auth_status():
             
     except Exception as e:
         return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/auth/providers', methods=['GET'])
+def auth_providers():
+    """List available authentication providers (including guest)."""
+    try:
+        return jsonify({
+            'success': True,
+            'providers': auth_manager.get_available_providers()
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/auth/guest', methods=['POST'])
+def auth_guest():
+    """Create or get a guest session for a machine."""
+    try:
+        data = request.json or {}
+        machine_id = data.get('machine_id') or request.headers.get('X-Machine-ID')
+        guest_name = data.get('guest_name') or request.headers.get('X-Guest-Name')
+        if not machine_id:
+            return jsonify({"success": False, "error": "machine_id required"}), 400
+        result = auth_manager.create_or_get_guest_session(machine_id, guest_name)
+        status = 200 if result.get('success') else 500
+        return jsonify(result), status
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/auth/logout', methods=['POST'])
 def auth_logout():
@@ -1634,6 +1756,10 @@ def auth_logout():
 
 @app.route('/embed', methods=['POST'])
 def embed_endpoint():
+    # Optional server key gate
+    gate = verify_server_key_if_required()
+    if gate is not None:
+        return gate
     """
     Cloud embedding endpoint for managing project file embeddings
     
@@ -1665,9 +1791,20 @@ def embed_endpoint():
         if not project_id:
             project_id = hashlib.md5(project_root.encode()).hexdigest()
         
+        if not CLOUD_VECTOR_ENABLED:
+            return jsonify({
+                "success": False,
+                "error": "Cloud vector indexing disabled (set GCP_PROJECT_ID or run in cloud mode)",
+                "action": action
+            }), 501
+
         if action == 'index_project':
             force_reindex = data.get('force_reindex', False)
-            stats = cloud_vector_manager.index_project(project_root, user['id'], project_id, force_reindex)
+            max_workers = data.get('max_workers')
+            try:
+                stats = cloud_vector_manager.index_project(project_root, user['id'], project_id, force_reindex, max_workers=max_workers)
+            except TypeError:
+                stats = cloud_vector_manager.index_project(project_root, user['id'], project_id, force_reindex)
             return jsonify({
                 "success": True,
                 "action": "index_project",
@@ -1695,7 +1832,11 @@ def embed_endpoint():
                 return jsonify({"error": "files array required for index_files action"}), 400
             
             batch_info = data.get('batch_info', {})
-            stats = cloud_vector_manager.index_files_with_content(files, user['id'], project_id)
+            max_workers = data.get('max_workers')
+            try:
+                stats = cloud_vector_manager.index_files_with_content(files, user['id'], project_id, max_workers=max_workers)
+            except TypeError:
+                stats = cloud_vector_manager.index_files_with_content(files, user['id'], project_id)
             
             return jsonify({
                 "success": True,
@@ -1783,6 +1924,9 @@ def embed_endpoint():
 
 @app.route('/search_project', methods=['POST'])
 def search_project():
+    gate = verify_server_key_if_required()
+    if gate is not None:
+        return gate
     """
     Search across project files using semantic similarity
     Used by the search_across_project tool
@@ -1819,6 +1963,11 @@ def search_project():
         max_results = data.get('max_results', 5)
 
         # Search using cloud vector manager
+        if not CLOUD_VECTOR_ENABLED or cloud_vector_manager is None:
+            return jsonify({
+                "success": False,
+                "error": "Cloud vector search disabled (set GCP_PROJECT_ID or run in cloud mode)"
+            }), 501
         results = cloud_vector_manager.search(query, user['id'], project_id, max_results)
         # Filter out Godot sidecar UID files
         results = [r for r in results if not str(r.get('file_path','')).endswith('.uid')]
@@ -1862,7 +2011,6 @@ def health_check():
 
 
 if __name__ == '__main__':
-    # Use PORT environment variable for Cloud Run, fallback to 8000 for local dev
+    # Local dev only; in production use Gunicorn (configured in Dockerfile)
     port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
     app.run(host='0.0.0.0', port=port, debug=False)

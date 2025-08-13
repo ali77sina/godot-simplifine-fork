@@ -1474,11 +1474,16 @@ Dictionary EditorTools::apply_edit(const Dictionary &p_args) {
         request_file->close();
         
         // Use curl via OS system call, mirroring headers used by chat/image gen
-        String is_dev = OS::get_singleton()->get_environment("IS_DEV");
-        if (is_dev.is_empty()) {
-            is_dev = OS::get_singleton()->get_environment("DEV_MODE");
+        String base_url;
+        if (EditorSettings::get_singleton() && EditorSettings::get_singleton()->has_setting("ai_chat/base_url")) {
+            base_url = EditorSettings::get_singleton()->get_setting("ai_chat/base_url");
         }
-        String base_url = (!is_dev.is_empty() && is_dev.to_lower() == "true") ? String("http://localhost:8000") : String("https://gamechat.simplifine.com");
+        if (base_url.is_empty()) {
+            base_url = OS::get_singleton()->get_environment("AI_CHAT_CLOUD_URL");
+        }
+        if (base_url.is_empty()) {
+            base_url = "http://127.0.0.1:8000";
+        }
         String curl_command = String("curl -X POST ") + base_url + String("/predict_code_edit ") +
             "-H \"Content-Type: application/json\" " +
             (auth_token.is_empty() ? String("") : String("-H \"Authorization: Bearer ") + auth_token + "\" ") +

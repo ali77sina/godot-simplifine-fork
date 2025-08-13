@@ -5,6 +5,7 @@ flask
 python-dotenv
 openai>=1.50.0  # Required for responses API and image generation
 requests  # For HTTP requests
+gunicorn  # Production WSGI server
 
 # Authentication (keeping for existing OAuth features)
 google-auth  # For OAuth authentication

@@ -1,35 +1,4 @@
-/**************************************************************************/
-/*  ai_chat_dock.cpp                                                      */
-/**************************************************************************/
-/*                         This file is part of:                          */
-/*                             GODOT ENGINE                               */
-/*                        https://godotengine.org                         */
-/**************************************************************************/
-/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
-/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
-/*                                                                        */
-/* Permission is hereby granted, free of charge, to any person obtaining  */
-/* a copy of this software and associated documentation files (the        */
-/* "Software"), to deal in the Software without restriction, including    */
-/* without limitation the rights to use, copy, modify, merge, publish,    */
-/* distribute, sublicense, and/or sell copies of the Software, and to     */
-/* permit persons to whom the Software is furnished to do so, subject to  */
-/* the following conditions:                                              */
-/*                                                                        */
-/* The above copyright notice and this permission notice shall be         */
-/* included in all copies or substantial portions of the Software.        */
-/*                                                                        */
-/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
-/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
-/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
-/**************************************************************************/
-
 #include "ai_chat_dock.h"
-
 #include "core/io/config_file.h"
 #include "core/io/json.h"
 #include "core/os/time.h"
@@ -71,6 +40,7 @@
 #include "scene/gui/popup_menu.h"
 #include "scene/main/http_request.h"
 #include "scene/resources/style_box_flat.h"
+#include "ai_auth_helper.h"
 #include "scene/2d/node_2d.h"
 #include "scene/3d/node_3d.h"
 #include "core/string/string_name.h"
@@ -171,7 +141,7 @@ void AIChatDock::_notification(int p_notification) {
 			top_container->add_child(model_label);
 
             model_dropdown = memnew(OptionButton);
-			model_dropdown->add_item("gpt-5");
+            model_dropdown->add_item("gpt-4o");
 			model_dropdown->add_item("gpt-4o");
 			model_dropdown->add_item("gpt-4-turbo");
 			model_dropdown->add_item("gpt-3.5-turbo");
@@ -179,13 +149,7 @@ void AIChatDock::_notification(int p_notification) {
 			model_dropdown->connect("item_selected", callable_mp(this, &AIChatDock::_on_model_selected));
 			top_container->add_child(model_dropdown);
 
-            // Index button
-            index_button = memnew(Button);
-            index_button->set_text("Index");
-            index_button->set_tooltip_text("Index current project for multimodal search");
-            index_button->add_theme_icon_override("icon", get_theme_icon(SNAME("ReloadSmall"), SNAME("EditorIcons")));
-            index_button->connect("pressed", callable_mp(this, &AIChatDock::_on_index_button_pressed));
-            top_container->add_child(index_button);
+            // Index button removed; indexing will be managed automatically
 
             // Embedding status label
             embedding_status_label = memnew(Label);
@@ -983,6 +947,11 @@ void AIChatDock::_setup_authentication_ui() {
 	auth_request = memnew(HTTPRequest);
 	add_child(auth_request);
 	auth_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_auth_request_completed));
+
+	// Create HTTP request for providers discovery
+	auth_providers_request = memnew(HTTPRequest);
+	add_child(auth_providers_request);
+	auth_providers_request->connect("request_completed", callable_mp(this, &AIChatDock::_on_auth_providers_request_completed));
 }
 
 void AIChatDock::_on_login_button_pressed() {
@@ -992,29 +961,83 @@ void AIChatDock::_on_login_button_pressed() {
 		return;
 	}
 	
-	// Open authentication in system browser
-	String auth_url = api_endpoint.replace("/chat", "/auth/login");
-	auth_url += "?machine_id=" + OS::get_singleton()->get_unique_id() + "&provider=google";
-	OS::get_singleton()->shell_open(auth_url);
-	
-	// Show simple notification (no manual action needed)
-	AcceptDialog *auth_dialog = memnew(AcceptDialog);
-	auth_dialog->set_text("🔐 Authentication opened in your browser.\n\nComplete the login and this will automatically detect when you're logged in!");
-	auth_dialog->set_title("AI Chat - Login");
-	auth_dialog->get_ok_button()->set_text("Got it!");
-	
-	get_viewport()->add_child(auth_dialog);
-	auth_dialog->popup_centered();
-	auth_dialog->connect("confirmed", callable_mp((Node *)auth_dialog, &Node::queue_free));
-	
-	// Start automatic polling for login completion
-	user_status_label->set_text("Waiting for login...");
-	_start_login_polling();
+    // Show a menu of providers, anchored to the login button
+    // Fetch provider availability from backend to hide unavailable options
+    String providers_url = api_endpoint.replace("/chat", "/auth/providers");
+    Error perr = auth_providers_request->request(providers_url);
+    if (perr != OK) {
+        print_line("AI Chat: Failed to fetch providers; defaulting to all options");
+    }
+    PopupMenu *providers = memnew(PopupMenu);
+    add_child(providers);
+    int id_google = 1;
+    int id_guest = 2;
+    providers->add_icon_item(get_theme_icon(SNAME("Key"), SNAME("EditorIcons")), "Sign in with Google", id_google);
+    providers->add_separator();
+    providers->add_icon_item(get_theme_icon(SNAME("Key"), SNAME("EditorIcons")), "Continue as Guest", id_guest);
+    providers->set_name("auth_provider_menu");
+    providers->connect("id_pressed", callable_mp(this, &AIChatDock::_on_auth_provider_selected));
+    // Popup directly under the login button using parent-anchored rect
+    Rect2i parent_rect(Point2i((int)login_button->get_global_position().x, (int)login_button->get_global_position().y),
+                       Size2i((int)login_button->get_size().x, (int)login_button->get_size().y));
+    parent_rect.position.y += parent_rect.size.y;
+    providers->popup_on_parent(parent_rect);
+}
+void AIChatDock::_on_auth_providers_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
+    if (p_code != 200) {
+        return;
+    }
+    String text = String::utf8((const char *)p_body.ptr(), p_body.size());
+    JSON json;
+    if (json.parse(text) != OK) {
+        return;
+    }
+    Dictionary resp = json.get_data();
+    if (!resp.get("success", false)) {
+        return;
+    }
+    Dictionary providers = resp.get("providers", Dictionary());
+    bool has_google = providers.get("google", false);
+    bool has_github = providers.get("github", false);
+    bool has_ms = providers.get("microsoft", false);
+    // If Microsoft is not configured, avoid letting user select it by clearing pending_provider when selected
+    if (pending_login_provider == "microsoft" && !has_ms) {
+        // Nothing to do here now; selection guarded at build time of menu ideally
+    }
 }
 
 void AIChatDock::_on_auth_dialog_action(const StringName &p_action) {
 	// This method is kept for compatibility but no longer used
 	// Login polling handles authentication automatically
+}
+
+void AIChatDock::_on_auth_provider_selected(int p_id) {
+    String provider;
+    if (p_id == 1) {
+        provider = "google";
+    } else if (p_id == 2) {
+        provider = "guest";
+    } else {
+        return;
+    }
+    pending_login_provider = provider;
+    if (provider == "guest") {
+        // Call backend to create/get guest session, then reflect in UI
+        current_user_id = "guest:" + get_machine_id();
+        current_user_name = "Guest";
+        auth_token = ""; // Guest flow in backend does not need token in headers
+        _update_user_status();
+        print_line("AI Chat: Using guest session");
+        return;
+    } else {
+        String machine_id = OS::get_singleton()->get_unique_id();
+        String url = AILoginHelper::build_auth_login_url(api_endpoint, machine_id, provider);
+        OS::get_singleton()->shell_open(url);
+    }
+
+    // Start polling silently; if Microsoft was chosen, require provider and disallow guest
+    user_status_label->set_text("Waiting for login...");
+    _start_login_polling();
 }
 
 void AIChatDock::_check_authentication_status() {
@@ -1026,6 +1049,11 @@ void AIChatDock::_check_authentication_status() {
 	
 	Dictionary data;
 	data["machine_id"] = OS::get_singleton()->get_unique_id();
+    if (!pending_login_provider.is_empty()) {
+        data["require_provider"] = pending_login_provider;
+        // While polling for a specific provider, do not accept guest fallback
+        data["allow_guest"] = false;
+    }
 	String json_data = JSON::stringify(data);
 	
 	Error err = auth_request->request(auth_check_url, headers, HTTPClient::METHOD_POST, json_data);
@@ -1071,11 +1099,12 @@ void AIChatDock::_on_auth_request_completed(int p_result, int p_code, const Pack
 		
 		print_line("AI Chat: ✅ User authenticated successfully: " + current_user_name);
 		
-		// Stop login polling if it was running
-		_stop_login_polling();
+        // Stop login polling if it was running
+        _stop_login_polling();
+        pending_login_provider = "";
 		
 		// Force UI update
-		_update_user_status();
+        _update_user_status();
 		
 		// Force comprehensive project indexing
 		_ensure_project_indexing();
@@ -1130,6 +1159,10 @@ void AIChatDock::_logout_user() {
 }
 
 bool AIChatDock::_is_user_authenticated() const {
+	// Treat guest sessions as authenticated for indexing and chat.
+	if (current_user_id.begins_with("guest:")) {
+		return true;
+	}
 	return !current_user_id.is_empty() && !auth_token.is_empty();
 }
 
@@ -1212,11 +1245,14 @@ void AIChatDock::_on_index_button_pressed() {
 void AIChatDock::_ensure_project_indexing() {
 	print_line("AI Chat: 🔄 Ensuring project indexing starts...");
 	
-	// Make sure user is authenticated
-	if (!_is_user_authenticated()) {
-		print_line("AI Chat: ❌ Cannot start indexing - user not authenticated");
-		return;
-	}
+    // If not authenticated, fallback to guest automatically
+    if (!_is_user_authenticated()) {
+        current_user_id = "guest:" + get_machine_id();
+        current_user_name = "Guest";
+        auth_token = "";
+        _update_user_status();
+        print_line("AI Chat: ℹ️ No auth detected; indexing as guest");
+    }
 	
 	// Initialize embedding system if needed
 	if (!embedding_system_initialized) {
@@ -5286,35 +5322,22 @@ void AIChatDock::_save_layout_to_config(Ref<ConfigFile> p_layout, const String &
 void AIChatDock::_load_layout_from_config(Ref<ConfigFile> p_layout, const String &p_section) {
 
 
-	// if (p_layout->has_section_key(p_section, "api_endpoint")) {
-    //     api_endpoint = p_layout->get_value(p_section, "api_endpoint");
-    //     // Normalize and migrate endpoint to cloud if it was pointing to localhost.
-    //     String endpoint = api_endpoint.strip_edges();
-    //     if (endpoint.is_empty()) {
-    //         api_endpoint = "https://gamechat.simplifine.com/chat";
-    //     } else {
-    //         String lower = endpoint.to_lower();
-    //         bool was_local = lower.find("localhost") != -1 || lower.find("127.0.0.1") != -1;
-    //         if (was_local) {
-    //             api_endpoint = "https://gamechat.simplifine.com/chat";
-    //         } else {
-    //             // Ensure scheme.
-    //             if (!endpoint.begins_with("http://") && !endpoint.begins_with("https://")) {
-    //                 endpoint = "https://" + endpoint;
-    //             }
-    //             // Ensure it contains /chat so other routes (auth/embed/stop) can be derived via replace.
-    //             if (endpoint.find("/chat") == -1) {
-    //                 endpoint = endpoint.ends_with("/") ? endpoint + "chat" : endpoint + "/chat";
-    //             }
-    //             api_endpoint = endpoint;
-    //         }
-    //     }
-    // }
 
-
-
-    // Force local endpoint unconditionally during development
-    api_endpoint = "http://127.0.0.1:8000/chat";
+    // Resolve endpoint from settings/env with fallback to localhost
+    String base_url;
+    if (EditorSettings::get_singleton() && EditorSettings::get_singleton()->has_setting("ai_chat/base_url")) {
+        base_url = EditorSettings::get_singleton()->get_setting("ai_chat/base_url");
+    }
+    if (base_url.is_empty()) {
+        base_url = OS::get_singleton()->get_environment("AI_CHAT_CLOUD_URL");
+    }
+    if (base_url.is_empty()) {
+        base_url = "http://127.0.0.1:8000";
+    }
+    if (base_url.ends_with("/")) {
+        base_url = base_url.substr(0, base_url.length() - 1);
+    }
+    api_endpoint = base_url + "/chat";
 	if (p_layout->has_section_key(p_section, "model")) {
 		model = p_layout->get_value(p_section, "model");
 	}
@@ -6775,8 +6798,12 @@ void AIChatDock::_initialize_embedding_system() {
     // Connect to editor file system signals for automatic reindexing
     // This connection does not require authentication; it only sets up callbacks.
     if (EditorFileSystem::get_singleton()) {
-        EditorFileSystem::get_singleton()->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
-        EditorFileSystem::get_singleton()->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
+        if (!EditorFileSystem::get_singleton()->is_connected("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed))) {
+            EditorFileSystem::get_singleton()->connect("filesystem_changed", callable_mp(this, &AIChatDock::_on_filesystem_changed));
+        }
+        if (!EditorFileSystem::get_singleton()->is_connected("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed))) {
+            EditorFileSystem::get_singleton()->connect("sources_changed", callable_mp(this, &AIChatDock::_on_sources_changed));
+        }
         print_line("AI Chat: 🔗 Connected to EditorFileSystem change signals (filesystem_changed, sources_changed)");
     } else {
         print_line("AI Chat: ⚠️ EditorFileSystem not ready; change signals not connected");

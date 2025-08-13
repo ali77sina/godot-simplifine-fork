@@ -19,5 +19,6 @@ EXPOSE 8080
 # Set environment variable for production
 ENV FLASK_ENV=production
 
-# Run the application
-CMD ["python", "app.py"]
+# Run the application with Gunicorn (Cloud Run provides PORT)
+ENV PORT=8080
+CMD ["gunicorn", "--bind", "0.0.0.0:${PORT}", "--workers", "2", "--threads", "8", "--timeout", "120", "app:app"]

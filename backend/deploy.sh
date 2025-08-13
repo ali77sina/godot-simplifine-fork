@@ -3,7 +3,16 @@
 # Godot AI Backend - Cloud Run Deployment Script
 
 # Configuration
-PROJECT_ID="${1:-eastern-rider-436701-f4}"
+# PROJECT_ID must be provided as arg or via GCP_PROJECT_ID env var.
+if [ -n "$1" ]; then
+    PROJECT_ID="$1"
+elif [ -n "$GCP_PROJECT_ID" ]; then
+    PROJECT_ID="$GCP_PROJECT_ID"
+else
+    echo "❌ Error: GCP project id not provided."
+    echo "Usage: ./deploy.sh <GCP_PROJECT_ID> (or set GCP_PROJECT_ID env var)"
+    exit 1
+fi
 SERVICE_NAME="godot-ai-backend"
 REGION="us-central1"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
@@ -66,12 +75,21 @@ if [ -f ".env" ]; then
     #     --member="serviceAccount:${COMPUTE_SA}" \
     #     --role="roles/aiplatform.user"
     
-    # Add production OAuth redirect URI
-    echo "🔗 Setting production OAuth redirect URI..."
-    PROD_OAUTH_URI="https://gamechat.simplifine.com/auth/callback"
-    if echo -n "$PROD_OAUTH_URI" | gcloud secrets create "OAUTH_REDIRECT_URI" --data-file=- --replication-policy="automatic" 2>/dev/null || \
-       echo -n "$PROD_OAUTH_URI" | gcloud secrets versions add "OAUTH_REDIRECT_URI" --data-file=- 2>/dev/null; then
-        echo "✅ Set OAUTH_REDIRECT_URI to production URL"
+    # Optionally set OAuth redirect URI from env or .env; otherwise skip
+    if grep -q '^OAUTH_REDIRECT_URI=' .env 2>/dev/null || [ -n "$OAUTH_REDIRECT_URI" ]; then
+        echo "🔗 Setting OAuth redirect URI from provided configuration..."
+        REDIRECT_VAL="${OAUTH_REDIRECT_URI}"
+        if [ -z "$REDIRECT_VAL" ]; then
+            REDIRECT_VAL=$(grep '^OAUTH_REDIRECT_URI=' .env | head -n1 | cut -d'=' -f2- | sed 's/^"//;s/"$//')
+        fi
+        if [ -n "$REDIRECT_VAL" ]; then
+            if echo -n "$REDIRECT_VAL" | gcloud secrets create "OAUTH_REDIRECT_URI" --data-file=- --replication-policy="automatic" 2>/dev/null || \
+               echo -n "$REDIRECT_VAL" | gcloud secrets versions add "OAUTH_REDIRECT_URI" --data-file=- 2>/dev/null; then
+                echo "✅ OAUTH_REDIRECT_URI set"
+            fi
+        fi
+    else
+        echo "ℹ️  Skipping OAUTH_REDIRECT_URI auto-set (provide in .env or OAUTH_REDIRECT_URI env to configure)"
     fi
     
     # Read .env and create secrets
@@ -114,11 +132,12 @@ if [ -n "$SECRET_REFS" ]; then
         --region ${REGION} \
         --allow-unauthenticated \
         --port 8080 \
-        --memory 1Gi \
-        --cpu 1 \
-        --min-instances 0 \
-        --max-instances 10 \
-        --timeout 300 \
+        --memory 4Gi \
+        --cpu 2 \
+        --concurrency 40 \
+        --min-instances 2 \
+        --max-instances 100 \
+        --timeout 600 \
         --set-env-vars "FLASK_ENV=production" \
         --set-secrets "$SECRET_REFS"
 else
@@ -129,11 +148,12 @@ else
         --region ${REGION} \
         --allow-unauthenticated \
         --port 8080 \
-        --memory 1Gi \
-        --cpu 1 \
-        --min-instances 0 \
-        --max-instances 10 \
-        --timeout 300 \
+        --memory 4Gi \
+        --cpu 2 \
+        --concurrency 40 \
+        --min-instances 2 \
+        --max-instances 100 \
+        --timeout 600 \
         --set-env-vars "FLASK_ENV=production"
 fi
 
@@ -149,5 +169,4 @@ echo ""
 echo "📋 To view logs:"
 echo "gcloud logs tail --follow --project=${PROJECT_ID} --resource-names=${SERVICE_NAME}"
 echo ""
-echo "🔗 Custom domain already configured:"
-echo "https://gamechat.simplifine.com"
+echo "ℹ️  If using a custom domain, ensure DNS and redirect URIs are configured."

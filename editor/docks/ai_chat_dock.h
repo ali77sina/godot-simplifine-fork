@@ -135,7 +135,7 @@ private:
 	OptionButton *model_dropdown = nullptr;
 	OptionButton *conversation_history_dropdown = nullptr;
 	Button *new_conversation_button = nullptr;
-	Button *index_button = nullptr;
+    Button *index_button = nullptr; // Removed from UI; kept to avoid widespread ref changes
 	TextEdit *input_field = nullptr;
 	Button *send_button = nullptr;
 	Button *stop_button = nullptr;
@@ -167,11 +167,14 @@ private:
 
 	// User authentication
 	HTTPRequest *auth_request = nullptr;
+	HTTPRequest *auth_providers_request = nullptr;
 	Button *login_button = nullptr;
 	Label *user_status_label = nullptr;
 	String current_user_id;
 	String current_user_name;
 	String auth_token;
+	String pending_login_provider;
+	String provider_pending_login;
 
 	// Login polling
 	Timer *login_poll_timer = nullptr;
@@ -414,6 +417,8 @@ private:
 	void _on_login_button_pressed();
 	void _on_auth_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	void _on_auth_dialog_action(const StringName &p_action);
+	void _on_auth_provider_selected(int p_id);
+	void _on_auth_providers_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	void _check_authentication_status();
 	void _auto_verify_saved_credentials();
 	void _start_login_polling();
