@@ -2784,17 +2784,21 @@ void AIChatDock::_execute_tool_calls(const Array &p_tool_calls) {
 			result = EditorTools::attach_script(args);
 		} else if (function_name == "manage_scene") {
 			result = EditorTools::manage_scene(args);
-		} else if (function_name == "add_collision_shape") {
+        } else if (function_name == "add_collision_shape") {
 			result = EditorTools::add_collision_shape(args);
 		} else if (function_name == "list_project_files") {
 			result = EditorTools::list_project_files(args);
+        } else if (function_name == "read_file") {
+            result = EditorTools::read_file(args);
 		} else if (function_name == "search_project_files") {
 			// search_project_files was renamed to list_project_files
 			result = EditorTools::list_project_files(args);
 		} else if (function_name == "read_file_content") {
-			result = EditorTools::read_file_content(args);
-    } else if (function_name == "read_file_advanced") {
-            result = EditorTools::read_file_advanced(args);
+            // Deprecated: route to unified read
+            result = EditorTools::read_file(args);
+        } else if (function_name == "read_file_advanced") {
+            // Deprecated: route to unified read
+            result = EditorTools::read_file(args);
         } else if (function_name == "apply_edit") {
             // Run apply_edit asynchronously to avoid blocking the UI (curl/OS execute can freeze main thread)
             pending_tool_tasks++;
@@ -3560,12 +3564,12 @@ void AIChatDock::_create_tool_specific_ui(VBoxContainer *p_content_vbox, const S
 		}
 		p_content_vbox->add_child(file_tree);
 
-	} else if (p_tool_name == "read_file_content" && p_success) {
+    } else if ((p_tool_name == "read_file" || p_tool_name == "read_file_content" || p_tool_name == "read_file_advanced") && p_success) {
 		VBoxContainer *file_content_vbox = memnew(VBoxContainer);
 		p_content_vbox->add_child(file_content_vbox);
 
 		// Get the file path from the original arguments
-		String file_path = p_args.get("path", p_result.get("file_path", "Unknown file"));
+        String file_path = p_args.get("path", p_result.get("file_path", "Unknown file"));
 		
 		Button *file_link = memnew(Button);
 		file_link->set_text(file_path);

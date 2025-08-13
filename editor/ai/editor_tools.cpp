@@ -1067,6 +1067,14 @@ Dictionary EditorTools::list_project_files(const Dictionary &p_args) {
 	return result;
 }
 
+Dictionary EditorTools::read_file(const Dictionary &p_args) {
+    // Unified read: if line range is present, use advanced; otherwise full content with preview fallback
+    if (p_args.has("start_line") || p_args.has("end_line")) {
+        return read_file_advanced(p_args);
+    }
+    return read_file_content(p_args);
+}
+
 Dictionary EditorTools::read_file_content(const Dictionary &p_args) {
 	Dictionary result;
 	if (!p_args.has("path")) {

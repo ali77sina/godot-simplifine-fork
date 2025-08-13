@@ -757,66 +757,14 @@ godot_tools = [
     {
         "type": "function",
         "function": {
-            "name": "search_project_files",
-            "description": "Search for files and directories matching a pattern across the entire project",
+            "name": "read_file",
+            "description": "Read file content. Optional start_line/end_line to fetch a range.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Search pattern (supports wildcards like '*.gd' or partial names like 'player')"
-                    },
-                    "dir": {
-                        "type": "string",
-                        "description": "Base directory to search from (default: res://)"
-                    },
-                    "case_sensitive": {
-                        "type": "boolean",
-                        "description": "Whether search should be case sensitive",
-                        "default": False
-                    }
-                },
-                "required": ["pattern"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file_content",
-            "description": "Read the contents of a file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to read"
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file_advanced",
-            "description": "Read specific lines from a file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to read"
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "Starting line number (1-indexed)"
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "Ending line number (inclusive)"
-                    }
+                    "path": { "type": "string", "description": "File path to read" },
+                    "start_line": { "type": "integer", "description": "Starting line (1-indexed)" },
+                    "end_line": { "type": "integer", "description": "Ending line (inclusive)" }
                 },
                 "required": ["path"]
             }

@@ -55,6 +55,7 @@ public:
 	static Dictionary generalnodeeditor(const Dictionary &p_args);
 	static Dictionary list_project_files(const Dictionary &p_args);
 	static Dictionary search_project_files(const Dictionary &p_args);
+	static Dictionary read_file(const Dictionary &p_args);
 	static Dictionary read_file_content(const Dictionary &p_args);
 	static Dictionary read_file_advanced(const Dictionary &p_args);
 	static Dictionary apply_edit(const Dictionary &p_args);

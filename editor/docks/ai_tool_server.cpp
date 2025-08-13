@@ -48,13 +48,17 @@ Dictionary AIToolServer::_handle_tool_request(const String &p_method, const Stri
 	Dictionary args = request_data.get("arguments", Dictionary());
 	
 	// Handle tool execution
-	// NOTE: apply_edit is now handled in the backend, not here
-	if (function_name == "list_project_files") {
+    // NOTE: apply_edit is now handled in the backend, not here
+    if (function_name == "list_project_files") {
 		result = EditorTools::list_project_files(args);
+    } else if (function_name == "read_file") {
+        result = EditorTools::read_file(args);
 	} else if (function_name == "read_file_content") {
-		result = EditorTools::read_file_content(args);
+        // Deprecated: route to unified read
+        result = EditorTools::read_file(args);
 	} else if (function_name == "read_file_advanced") {
-		result = EditorTools::read_file_advanced(args);
+        // Deprecated: route to unified read
+        result = EditorTools::read_file(args);
 	} else if (function_name == "get_scene_info") {
 		result = EditorTools::get_scene_info(args);
 	} else if (function_name == "get_all_nodes") {
